@@ -1,0 +1,70 @@
+name: x8086
+options:
+  bundleIdPrefix: com.saifurrahmann.x8086
+  deploymentTarget:
+    macOS: "13.0"
+configs:
+  Debug: debug
+  Release: release
+targets:
+  x8086:
+    type: application
+    platform: macOS
+    sources:
+      - path: x8086
+      - path: Generated
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.saifurrahmann.x8086
+        MACOSX_DEPLOYMENT_TARGET: "13.0"
+        SWIFT_VERSION: "5.0"
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: x8086
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.0"
+    dependencies:
+      - framework: ../build/x8086FFI.xcframework
+        embed: false
+    preBuildScripts:
+      - name: "Build Rust core (universal)"
+        script: |
+          "${SRCROOT}/../scripts/build-universal.sh"
+        basedOnDependencyAnalysis: false
+  x8086Tests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: x8086Tests
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: x8086
+  x8086UITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: x8086UITests
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: x8086
+schemes:
+  x8086:
+    build:
+      targets:
+        x8086: [run, test, archive]
+        x8086Tests: [test]
+        x8086UITests: [test]
+    test:
+      targets:
+        - x8086Tests
+        - x8086UITests
+    run:
+      config: Debug

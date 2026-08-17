@@ -1,0 +1,19 @@
+[package]
+name = "x8086-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Thin uniffi bridge exposing the x8086-emulator facade to Swift. Marshaling only, no business logic."
+
+[lib]
+name = "x8086_ffi"
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+x8086-emulator = { path = "../x8086-emulator" }
+uniffi = { version = "0.28", features = ["cli"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"

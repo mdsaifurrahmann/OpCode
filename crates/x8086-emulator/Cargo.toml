@@ -1,0 +1,16 @@
+[package]
+name = "x8086-emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Stateful facade tying together CPU, memory, decoder, interrupts, and debugger into the emulator's public API."
+
+[dependencies]
+x8086-isa = { path = "../x8086-isa" }
+x8086-memory = { path = "../x8086-memory" }
+x8086-decoder = { path = "../x8086-decoder" }
+x8086-cpu = { path = "../x8086-cpu" }
+x8086-assembler = { path = "../x8086-assembler" }
+x8086-interrupts = { path = "../x8086-interrupts" }
+x8086-debugger = { path = "../x8086-debugger" }

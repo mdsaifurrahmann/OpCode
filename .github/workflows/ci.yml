@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Job 1: gates every PR on Rust correctness without needing Xcode.
+  rust-checks:
+    name: Rust checks (fmt, clippy, test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+  # Job 2: proves the universal (arm64 + x86_64) XCFramework still builds,
+  # independent of whether the Xcode project itself is touched.
+  build-universal:
+    name: Build universal XCFramework
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build universal x8086-ffi + XCFramework
+        run: ./scripts/build-universal.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x8086FFI-xcframework
+          path: build/x8086FFI.xcframework
+
+  # Job 3: Xcode unit tests (view-model/logic level).
+  xcode-unit-tests:
+    name: Xcode unit tests
+    runs-on: macos-latest
+    needs: rust-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build universal x8086-ffi + XCFramework
+        run: ./scripts/build-universal.sh
+
+      - name: Generate Xcode project
+        working-directory: x8086-mac
+        run: xcodegen generate
+
+      - name: Run unit tests
+        working-directory: x8086-mac
+        run: xcodebuild -project x8086.xcodeproj -scheme x8086 -destination 'platform=macOS' -only-testing:x8086Tests test
+
+  # Job 4: XCUITest full-flow E2E tests. Runs on every PR since these are a
+  # hard requirement of the project, not optional polish.
+  xcode-e2e-tests:
+    name: Xcode UI (E2E) tests
+    runs-on: macos-latest
+    needs: rust-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build universal x8086-ffi + XCFramework
+        run: ./scripts/build-universal.sh
+
+      - name: Generate Xcode project
+        working-directory: x8086-mac
+        run: xcodegen generate
+
+      - name: Run UI tests
+        working-directory: x8086-mac
+        run: xcodebuild -project x8086.xcodeproj -scheme x8086 -destination 'platform=macOS' -only-testing:x8086UITests test
+
+  # Job 5 (release: codesign, notarize, package .dmg) lands once the project
+  # reaches the hardening/release phase - it needs a real Developer ID
+  # certificate, which doesn't exist yet.

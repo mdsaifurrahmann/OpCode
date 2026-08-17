@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/x8086-isa",
+    "crates/x8086-memory",
+    "crates/x8086-decoder",
+    "crates/x8086-cpu",
+    "crates/x8086-assembler",
+    "crates/x8086-interrupts",
+    "crates/x8086-debugger",
+    "crates/x8086-emulator",
+    "crates/x8086-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[profile.release]
+lto = true
+codegen-units = 1

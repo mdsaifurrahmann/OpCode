@@ -1,0 +1,25 @@
+# Rust
+/target/
+crates/*/target/
+Cargo.lock.bak
+
+# Generated FFI artifacts (rebuilt by scripts/build-universal.sh)
+/build/
+*.xcframework/
+x8086-mac/Generated/
+
+# Xcode
+# The .xcodeproj is fully regenerated from project.yml via `xcodegen
+# generate` (and depends on Generated/, which is itself gitignored above),
+# so it's a build artifact, not a source file - regenerate it, don't commit
+# or hand-edit it.
+x8086-mac/*.xcodeproj/
+x8086-mac/**/DerivedData/
+x8086-mac/build/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store

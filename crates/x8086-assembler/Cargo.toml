@@ -1,0 +1,10 @@
+[package]
+name = "x8086-assembler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "emu8086-syntax lexer, parser, and two-pass assembler producing machine code, a line map, and diagnostics."
+
+[dependencies]
+x8086-isa = { path = "../x8086-isa" }

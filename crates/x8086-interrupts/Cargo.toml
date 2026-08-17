@@ -1,0 +1,11 @@
+[package]
+name = "x8086-interrupts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "emu8086-style simulated BIOS/DOS interrupt services (INT 21h/10h/16h/20h)."
+
+[dependencies]
+x8086-cpu = { path = "../x8086-cpu" }
+x8086-memory = { path = "../x8086-memory" }

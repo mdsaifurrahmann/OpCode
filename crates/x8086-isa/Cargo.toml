@@ -1,0 +1,7 @@
+[package]
+name = "x8086-isa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared 8086/80186 instruction, register, and opcode model used by the decoder and assembler."
