@@ -720,6 +720,8 @@ name = "x8086-ffi"
 version = "0.1.0"
 dependencies = [
  "uniffi",
+ "x8086-assembler",
+ "x8086-cpu",
  "x8086-emulator",
 ]
 

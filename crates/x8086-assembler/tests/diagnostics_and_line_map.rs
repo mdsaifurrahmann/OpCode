@@ -5,6 +5,29 @@
 use x8086_assembler::assemble;
 
 #[test]
+fn lea_with_a_forward_referenced_data_variable_computes_the_correct_address() {
+    // Regression test: a bare reference to a DB/DW variable declared
+    // *after* the instruction that uses it (the common "code first,
+    // data section after" style) must resolve to a Memory-shaped
+    // operand even while its address is still unknown during pass 1 -
+    // getting the shape wrong there made LEA fail to encode during
+    // pass 1 (silently defaulting its length to 0), which shifted every
+    // subsequent address and corrupted the loaded pointer.
+    let result = assemble("LEA DX, msg\nHLT\nmsg DB \"Hi$\"\n");
+    assert!(
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result.diagnostics
+    );
+    // LEA DX,[msg] (direct address form) = 8D 16 <disp16>; HLT = F4;
+    // then the "Hi$" bytes. msg must sit right after HLT, at offset 5.
+    assert_eq!(
+        result.machine_code,
+        vec![0x8D, 0x16, 0x05, 0x00, 0xF4, b'H', b'i', b'$']
+    );
+}
+
+#[test]
 fn undefined_symbol_reports_the_correct_line() {
     let result = assemble("HLT\nMOV AX, missing_symbol");
     assert_eq!(

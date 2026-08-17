@@ -52,9 +52,26 @@ pub fn assemble(source: &str) -> AssembleResult {
     let mut diagnostics: Vec<Diagnostic> =
         parse_errors.iter().map(parse_error_to_diagnostic).collect();
 
-    let (symbols, lengths) = pass_one(&statements, &mut diagnostics);
-    let (machine_code, line_to_address, entry_point) =
-        pass_two(&statements, &symbols, &lengths, &mut diagnostics);
+    // A symbol's *kind* (Data vs. Label/Constant) only depends on where
+    // it's declared in the source, never on an address - so it can be
+    // determined in one pure syntax pass, independent of pass 1's
+    // address bookkeeping. This matters: pass 1 needs it for *forward*
+    // references (e.g. `LEA DX, msg` appearing before `msg DB ...`), to
+    // resolve them with the right operand *shape* (Memory vs Immediate)
+    // even though the real address isn't known yet - getting the shape
+    // wrong would make the encoded length wrong too (LEA requires a
+    // Memory operand; an Immediate placeholder makes it fail to encode
+    // at all), corrupting every address that follows.
+    let symbol_kinds = prescan_symbol_kinds(&statements);
+
+    let (symbols, lengths) = pass_one(&statements, &symbol_kinds, &mut diagnostics);
+    let (machine_code, line_to_address, entry_point) = pass_two(
+        &statements,
+        &symbols,
+        &symbol_kinds,
+        &lengths,
+        &mut diagnostics,
+    );
 
     let mut symbol_entries: Vec<SymbolTableEntry> = symbols
         .into_iter()
@@ -74,10 +91,28 @@ pub fn assemble(source: &str) -> AssembleResult {
     }
 }
 
+/// One pure syntax pass to learn every symbol's kind ahead of pass 1 -
+/// see the comment in `assemble` for why this needs to be separate from
+/// (and run before) address computation.
+fn prescan_symbol_kinds(statements: &[Statement]) -> BTreeMap<String, SymbolKind> {
+    let mut kinds = BTreeMap::new();
+    for (i, stmt) in statements.iter().enumerate() {
+        if let StatementKind::Label(name) = &stmt.kind {
+            let kind = match statements.get(i + 1).map(|s| &s.kind) {
+                Some(StatementKind::Db(_)) | Some(StatementKind::Dw(_)) => SymbolKind::Data,
+                _ => SymbolKind::Label,
+            };
+            kinds.insert(name.clone(), kind);
+        }
+    }
+    kinds
+}
+
 // --- pass 1: symbol table + lengths -----------------------------------------
 
 fn pass_one(
     statements: &[Statement],
+    symbol_kinds: &BTreeMap<String, SymbolKind>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (SymbolTable, Vec<u32>) {
     let mut symbols = SymbolTable::new();
@@ -136,6 +171,7 @@ fn pass_one(
                     operands,
                     *short_jump,
                     &symbols,
+                    symbol_kinds,
                     location_counter,
                     false,
                 ) {
@@ -158,6 +194,7 @@ fn pass_one(
 fn pass_two(
     statements: &[Statement],
     symbols: &SymbolTable,
+    symbol_kinds: &BTreeMap<String, SymbolKind>,
     lengths: &[u32],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<u8>, BTreeMap<u32, u32>, u32) {
@@ -207,8 +244,15 @@ fn pass_two(
                 operands,
                 short_jump,
             } => {
-                match resolve_instruction(*mnemonic, operands, *short_jump, symbols, address, true)
-                {
+                match resolve_instruction(
+                    *mnemonic,
+                    operands,
+                    *short_jump,
+                    symbols,
+                    symbol_kinds,
+                    address,
+                    true,
+                ) {
                     Ok(instr) => match encode_one(&instr) {
                         Ok(bytes) => {
                             line_to_address.insert(stmt.line, address);
@@ -346,6 +390,7 @@ fn resolve_instruction(
     operands: &[ParsedOperand],
     short_jump: bool,
     symbols: &SymbolTable,
+    symbol_kinds: &BTreeMap<String, SymbolKind>,
     location_counter: u32,
     strict: bool,
 ) -> Result<Instruction, String> {
@@ -363,7 +408,7 @@ fn resolve_instruction(
     let width = determine_width(mnemonic, operands)?;
     let mut resolved = Vec::with_capacity(operands.len());
     for op in operands {
-        resolved.push(resolve_operand(op, symbols, strict)?);
+        resolved.push(resolve_operand(op, symbols, symbol_kinds, strict)?);
     }
     Ok(Instruction::new(mnemonic, resolved, width, 0))
 }
@@ -439,6 +484,7 @@ fn resolve_branch_instruction(
 fn resolve_operand(
     operand: &ParsedOperand,
     symbols: &SymbolTable,
+    symbol_kinds: &BTreeMap<String, SymbolKind>,
     strict: bool,
 ) -> Result<Operand, String> {
     match operand {
@@ -452,7 +498,15 @@ fn resolve_operand(
                 }
             },
             None if strict => Err(format!("undefined symbol '{name}'")),
-            None => Ok(Operand::Immediate(0)),
+            // Forward reference during pass 1: the value is genuinely
+            // unknown (0 placeholder), but the operand *shape* must
+            // still match what the symbol will turn out to be - the
+            // pre-scanned kind (see `prescan_symbol_kinds`) is what
+            // makes that possible before the symbol is actually defined.
+            None => match symbol_kinds.get(name) {
+                Some(SymbolKind::Data) => Ok(Operand::mem_direct(0)),
+                _ => Ok(Operand::Immediate(0)),
+            },
         },
         ParsedOperand::Immediate(expr) => {
             let value = if strict {

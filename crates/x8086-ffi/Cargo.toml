@@ -12,6 +12,8 @@ crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
 x8086-emulator = { path = "../x8086-emulator" }
+x8086-assembler = { path = "../x8086-assembler" }
+x8086-cpu = { path = "../x8086-cpu" }
 uniffi = { version = "0.28", features = ["cli"] }
 
 [[bin]]

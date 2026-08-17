@@ -10,7 +10,9 @@ pub const MEMORY_SIZE: usize = 1 << 20;
 
 /// Notified on every byte write, so the debugger can build undo/step-back
 /// history without the memory model needing to know what a "snapshot" is.
-pub trait WriteObserver {
+/// Requires `Send` so a `Memory` (and anything embedding it, like the
+/// emulator facade) stays safe to expose across an FFI/thread boundary.
+pub trait WriteObserver: Send {
     fn on_write(&mut self, address: u32, old_value: u8, new_value: u8);
 }
 
@@ -116,12 +118,13 @@ mod tests {
     fn write_observer_is_notified_with_old_and_new_values() {
         let mut mem = Memory::new();
         // Observer capture happens through a shared handle so the test can
-        // inspect events after the fact.
-        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        struct SharedRecorder(std::rc::Rc<std::cell::RefCell<Vec<(u32, u8, u8)>>>);
+        // inspect events after the fact. Arc<Mutex<_>>, not Rc<RefCell<_>>:
+        // WriteObserver requires Send (see its doc comment).
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct SharedRecorder(std::sync::Arc<std::sync::Mutex<Vec<(u32, u8, u8)>>>);
         impl WriteObserver for SharedRecorder {
             fn on_write(&mut self, address: u32, old_value: u8, new_value: u8) {
-                self.0.borrow_mut().push((address, old_value, new_value));
+                self.0.lock().unwrap().push((address, old_value, new_value));
             }
         }
         mem.set_observer(Box::new(SharedRecorder(events.clone())));
@@ -131,7 +134,7 @@ mod tests {
         mem.write_u8(0x0100, 0x43);
 
         assert_eq!(
-            *events.borrow(),
+            *events.lock().unwrap(),
             vec![(0x0100, 0x00, 0x42), (0x0100, 0x42, 0x43)]
         );
     }
