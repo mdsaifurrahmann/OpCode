@@ -70,6 +70,7 @@ fn arithmetic_and_control_flow_golden_program_reaches_expected_final_state() {
         match emulator.step().expect("golden program must decode cleanly") {
             StepOutcome::Halted => break,
             StepOutcome::Continued => {}
+            StepOutcome::WaitingForKeyboard => panic!("this program does no keyboard I/O"),
         }
         steps += 1;
         assert!(

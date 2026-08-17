@@ -55,6 +55,7 @@ fn source_assembles_cleanly_and_runs_to_the_same_final_state_as_the_hand_assembl
         {
             StepOutcome::Halted => break,
             StepOutcome::Continued => {}
+            StepOutcome::WaitingForKeyboard => panic!("this program does no keyboard I/O"),
         }
         steps += 1;
         assert!(
