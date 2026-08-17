@@ -673,6 +673,7 @@ dependencies = [
 name = "x8086-assembler"
 version = "0.1.0"
 dependencies = [
+ "x8086-decoder",
  "x8086-isa",
 ]
 

@@ -8,3 +8,8 @@ description = "emu8086-syntax lexer, parser, and two-pass assembler producing ma
 
 [dependencies]
 x8086-isa = { path = "../x8086-isa" }
+
+[dev-dependencies]
+# Round-trip validation only (encode, then decode back and compare) -
+# not a runtime dependency of the assembler itself.
+x8086-decoder = { path = "../x8086-decoder" }

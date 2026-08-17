@@ -249,6 +249,35 @@ impl Reg16 {
             _ => None,
         }
     }
+
+    /// The inverse of `from_index` - the encoder's counterpart to the
+    /// decoder's register-field lookup. `None` for registers that have
+    /// no plain 3-bit general-purpose encoding (`IP` is never directly
+    /// addressable this way).
+    pub fn to_index(self) -> Option<u8> {
+        match self {
+            Reg16::Ax => Some(0),
+            Reg16::Cx => Some(1),
+            Reg16::Dx => Some(2),
+            Reg16::Bx => Some(3),
+            Reg16::Sp => Some(4),
+            Reg16::Bp => Some(5),
+            Reg16::Si => Some(6),
+            Reg16::Di => Some(7),
+            Reg16::Cs | Reg16::Ds | Reg16::Es | Reg16::Ss | Reg16::Ip => None,
+        }
+    }
+
+    /// The inverse of `segment_from_index`.
+    pub fn to_segment_index(self) -> Option<u8> {
+        match self {
+            Reg16::Es => Some(0),
+            Reg16::Cs => Some(1),
+            Reg16::Ss => Some(2),
+            Reg16::Ds => Some(3),
+            _ => None,
+        }
+    }
 }
 
 impl Reg8 {
@@ -268,11 +297,75 @@ impl Reg8 {
             _ => unreachable!("index & 0b111 is always in 0..=7"),
         }
     }
+
+    /// The inverse of `from_index`.
+    pub fn to_index(self) -> u8 {
+        match self {
+            Reg8::Al => 0,
+            Reg8::Cl => 1,
+            Reg8::Dl => 2,
+            Reg8::Bl => 3,
+            Reg8::Ah => 4,
+            Reg8::Ch => 5,
+            Reg8::Dh => 6,
+            Reg8::Bh => 7,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reg16_to_index_round_trips_with_from_index() {
+        let all = [
+            Reg16::Ax,
+            Reg16::Cx,
+            Reg16::Dx,
+            Reg16::Bx,
+            Reg16::Sp,
+            Reg16::Bp,
+            Reg16::Si,
+            Reg16::Di,
+        ];
+        for reg in all {
+            let index = reg.to_index().unwrap();
+            assert_eq!(Reg16::from_index(index), reg);
+        }
+    }
+
+    #[test]
+    fn reg16_to_index_is_none_for_segment_and_ip_registers() {
+        for reg in [Reg16::Cs, Reg16::Ds, Reg16::Es, Reg16::Ss, Reg16::Ip] {
+            assert_eq!(reg.to_index(), None);
+        }
+    }
+
+    #[test]
+    fn reg16_to_segment_index_round_trips_with_segment_from_index() {
+        for reg in [Reg16::Es, Reg16::Cs, Reg16::Ss, Reg16::Ds] {
+            let index = reg.to_segment_index().unwrap();
+            assert_eq!(Reg16::segment_from_index(index), Some(reg));
+        }
+    }
+
+    #[test]
+    fn reg8_to_index_round_trips_with_from_index() {
+        let all = [
+            Reg8::Al,
+            Reg8::Cl,
+            Reg8::Dl,
+            Reg8::Bl,
+            Reg8::Ah,
+            Reg8::Ch,
+            Reg8::Dh,
+            Reg8::Bh,
+        ];
+        for reg in all {
+            assert_eq!(Reg8::from_index(reg.to_index()), reg);
+        }
+    }
 
     #[test]
     fn segment_registers_are_classified_correctly() {

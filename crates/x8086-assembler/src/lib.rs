@@ -8,6 +8,16 @@
 //! the assembler build phase; this scaffold wires up the lexer plus the
 //! result/diagnostic shapes the rest of the system will depend on.
 
+pub mod ast;
+mod codegen;
+mod encoder;
+mod expr_parser;
+mod mnemonics;
+mod numbers;
+mod operand_parser;
+mod parse_error;
+mod statement_parser;
+
 use std::collections::BTreeMap;
 
 const REGISTER_NAMES: &[&str] = &[
@@ -15,7 +25,7 @@ const REGISTER_NAMES: &[&str] = &[
     "bh", "cl", "ch", "dl", "dh",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Span {
     pub line: u32,
     pub col: u32,
@@ -153,6 +163,11 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         }
         if c.is_ascii_alphabetic() || c == '_' || c == '.' || c == '@' {
             let start = i;
+            // Unconditionally consume the starting character: '.' and
+            // '@' are valid identifier starts but not valid continuation
+            // characters, so a while-loop condition alone would never
+            // advance past them, hanging forever on input like ".MODEL".
+            i += 1;
             while i < bytes.len() && {
                 let ch = bytes[i] as char;
                 ch.is_ascii_alphanumeric() || ch == '_'
@@ -200,6 +215,14 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// A resolved symbol (label, `EQU` constant, or data variable), exposed
+/// for a future Variables/Watch panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolTableEntry {
+    pub name: String,
+    pub value: i64,
+}
+
 /// The result of assembling a source file: the encoded program, a
 /// source-line <-> address map (for breakpoints and step highlighting),
 /// and any diagnostics collected across both passes.
@@ -209,14 +232,13 @@ pub struct AssembleResult {
     pub entry_point: u32,
     pub line_to_address: BTreeMap<u32, u32>,
     pub diagnostics: Vec<Diagnostic>,
+    pub symbols: Vec<SymbolTableEntry>,
 }
 
-/// Two-pass assemble of emu8086-syntax source. The full directive parser
-/// and codegen land during the assembler build phase; today this always
-/// returns an empty program so downstream crates (and their tests) can be
-/// wired up against the final shape ahead of that work.
-pub fn assemble(_source: &str) -> AssembleResult {
-    AssembleResult::default()
+/// Two-pass assemble of emu8086-syntax source: lex -> parse -> resolve
+/// symbols/addresses -> encode. See `codegen` for the pass structure.
+pub fn assemble(source: &str) -> AssembleResult {
+    codegen::assemble(source)
 }
 
 #[cfg(test)]
@@ -237,6 +259,19 @@ mod tests {
             ]
         );
         assert_eq!(tokens[0].text, "MOV".to_string());
+    }
+
+    #[test]
+    fn identifiers_starting_with_dot_or_at_terminate_and_tokenize_correctly() {
+        // Regression test: '.' and '@' are valid identifier *starts*
+        // (".MODEL", "@@local") but not valid continuation characters,
+        // so the identifier scanner must unconditionally consume the
+        // start character before checking the continuation predicate -
+        // otherwise it never advances and tokenize() loops forever.
+        let tokens = tokenize(".MODEL SMALL");
+        assert_eq!(tokens[0].kind, TokenKind::Identifier);
+        assert_eq!(tokens[0].text, ".MODEL");
+        assert_eq!(tokens[1].text, "SMALL");
     }
 
     #[test]
@@ -286,9 +321,9 @@ mod tests {
     }
 
     #[test]
-    fn assemble_stub_returns_empty_program() {
+    fn assemble_encodes_a_simple_instruction() {
         let result = assemble("MOV AX, 5");
-        assert!(result.machine_code.is_empty());
         assert!(result.diagnostics.is_empty());
+        assert_eq!(result.machine_code, vec![0xB8, 0x05, 0x00]);
     }
 }
