@@ -8,12 +8,11 @@
 //! the architecture plan (so `run()` never blocks the FFI-calling
 //! thread) lands with the interrupts-integration phase, once there is
 //! actually a blocking keyboard-read to design around; today `step()` is
-//! synchronous, matching what the decoder can decode so far (HLT only).
+//! synchronous.
 
-use x8086_cpu::Registers;
+use x8086_cpu::{ExecutionEffect, Registers};
 use x8086_debugger::{Breakpoints, History, HistoryEntry};
 use x8086_decoder::{decode_one, DecodeError};
-use x8086_isa::Mnemonic;
 use x8086_memory::Memory;
 
 /// Longest possible 8086 instruction encoding is 6 bytes (full ModRM +
@@ -83,10 +82,20 @@ impl Emulator {
         let (instruction, len) = decode_one(&window)?;
 
         let registers_before = self.registers;
+        // x8086_cpu::execute expects IP to already point past the
+        // instruction being run (see its module docs) - relative jumps
+        // measure their displacement from here.
         self.registers.ip = self.registers.ip.wrapping_add(len as u16);
-        if instruction.mnemonic == Mnemonic::Hlt {
-            self.halted = true;
+
+        // Simulated interrupts (INT 21h/10h/etc.) are dispatched through
+        // x8086-interrupts once that's wired into this facade in a later
+        // phase; for now `ExecutionEffect::Interrupt` is a no-op beyond
+        // the IP advance already applied above.
+        match x8086_cpu::execute(&instruction, &mut self.registers, &mut self.memory) {
+            ExecutionEffect::Halted => self.halted = true,
+            ExecutionEffect::Continue | ExecutionEffect::Interrupt(_) => {}
         }
+
         self.history.push(HistoryEntry {
             registers_before,
             memory_diffs: vec![],
@@ -147,7 +156,7 @@ mod tests {
     #[test]
     fn stepping_an_unknown_opcode_is_an_error() {
         let mut emulator = Emulator::new();
-        emulator.load_program(&[0x0F]); // not yet in the (stub) decoder's table
+        emulator.load_program(&[0x0F]); // reserved on 8086/80186, deliberately undecoded
         assert!(emulator.step().is_err());
     }
 

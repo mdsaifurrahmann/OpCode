@@ -8,3 +8,10 @@ description = "Pure byte-to-Instruction decoder for the 8086/80186 instruction s
 
 [dependencies]
 x8086-isa = { path = "../x8086-isa" }
+
+[dev-dependencies]
+# Cross-validation oracle only (see tests/iced_cross_validation.rs) - not
+# a runtime dependency. Its disassembly text/opcode-surface doesn't match
+# emu8086 conventions, so the real decoder is hand-written, but iced-x86
+# is a mature, well-tested reference to catch decode-length/family bugs.
+iced-x86 = "1"

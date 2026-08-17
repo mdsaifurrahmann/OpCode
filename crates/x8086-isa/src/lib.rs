@@ -3,9 +3,7 @@
 //! This crate is the single source of truth for what an "instruction" is.
 //! `x8086-decoder` turns bytes into these types; `x8086-assembler` turns
 //! these types into bytes. Keeping both on one model is what keeps them
-//! from drifting apart. The opcode table itself is filled in during the
-//! CPU-core and assembler build phases; this scaffold establishes the
-//! shapes everything else depends on.
+//! from drifting apart.
 
 /// A 16-bit general-purpose or segment register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,16 +50,84 @@ pub enum Flag {
     Overflow,
 }
 
-/// Instruction mnemonics. Populated incrementally as the decoder and
-/// assembler are built out; `Unknown` is a placeholder for bytes/text
-/// that don't yet map to a real variant.
+/// Operand width, decoded from an opcode's `w` bit (or implied by the
+/// instruction). Determines both how many bytes a memory operand reads/
+/// writes and how flags (overflow, carry) are computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Width {
+    Byte,
+    Word,
+}
+
+/// The 16 condition codes that gate conditional jumps (opcodes 70h-7Fh).
+/// Kept as data on `Mnemonic::Jcc` rather than 16 separate mnemonics,
+/// since they're one instruction family with one encoding pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Condition {
+    Overflow,
+    NotOverflow,
+    Below,
+    AboveOrEqual,
+    Equal,
+    NotEqual,
+    BelowOrEqual,
+    Above,
+    Sign,
+    NotSign,
+    Parity,
+    NotParity,
+    Less,
+    GreaterOrEqual,
+    LessOrEqual,
+    Greater,
+}
+
+/// Instruction mnemonics. Populated incrementally as decoder coverage
+/// grows; `Unknown` is a placeholder for bytes that don't yet map to a
+/// real variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mnemonic {
+    // Data transfer
     Mov,
+    Push,
+    Pop,
+    Xchg,
+    Lea,
+    // Arithmetic
     Add,
+    Adc,
     Sub,
+    Sbb,
+    Cmp,
+    Inc,
+    Dec,
+    // Logic
+    And,
+    Or,
+    Xor,
+    Test,
+    // Control transfer
+    Jmp,
+    Jcc(Condition),
+    Loop,
+    Loope,
+    Loopne,
+    Jcxz,
+    Call,
+    Ret,
     Int,
+    Int3,
+    Iret,
+    // Processor control
     Hlt,
+    Nop,
+    Clc,
+    Stc,
+    Cmc,
+    Cld,
+    Std,
+    Cli,
+    Sti,
     Unknown,
 }
 
@@ -80,19 +146,127 @@ pub enum Operand {
     },
 }
 
+impl Operand {
+    /// A direct-addressed memory operand: `[disp16]`, no base or index.
+    pub fn mem_direct(displacement: i32) -> Self {
+        Operand::Memory {
+            segment_override: None,
+            base: None,
+            index: None,
+            displacement,
+        }
+    }
+
+    /// A base/index/displacement memory operand, e.g. `[BX+SI+4]`.
+    pub fn mem(base: Option<Reg16>, index: Option<Reg16>, displacement: i32) -> Self {
+        Operand::Memory {
+            segment_override: None,
+            base,
+            index,
+            displacement,
+        }
+    }
+
+    pub fn with_segment_override(self, segment: Reg16) -> Self {
+        match self {
+            Operand::Memory {
+                base,
+                index,
+                displacement,
+                ..
+            } => Operand::Memory {
+                segment_override: Some(segment),
+                base,
+                index,
+                displacement,
+            },
+            other => other,
+        }
+    }
+}
+
 /// A decoded (or about-to-be-encoded) instruction, independent of whether
 /// it came from bytes (decoder) or source text (assembler).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
     pub mnemonic: Mnemonic,
     pub operands: Vec<Operand>,
-    /// Length in bytes once encoded; `None` until known.
-    pub byte_len: Option<u8>,
+    /// Operand width for instructions where it matters (arithmetic,
+    /// logic, data transfer); `None` for width-independent instructions
+    /// like `HLT` or `JMP`.
+    pub width: Option<Width>,
+    /// Length in bytes once encoded/decoded.
+    pub byte_len: u8,
+}
+
+impl Instruction {
+    pub fn new(
+        mnemonic: Mnemonic,
+        operands: Vec<Operand>,
+        width: Option<Width>,
+        byte_len: u8,
+    ) -> Self {
+        Self {
+            mnemonic,
+            operands,
+            width,
+            byte_len,
+        }
+    }
 }
 
 impl Reg16 {
     pub fn is_segment(self) -> bool {
         matches!(self, Reg16::Cs | Reg16::Ds | Reg16::Es | Reg16::Ss)
+    }
+
+    /// Decode a 3-bit general-purpose register field (used as both the
+    /// ModRM `reg` field and the low 3 bits of register-form opcodes)
+    /// into a 16-bit register.
+    pub fn from_index(index: u8) -> Reg16 {
+        match index & 0b111 {
+            0 => Reg16::Ax,
+            1 => Reg16::Cx,
+            2 => Reg16::Dx,
+            3 => Reg16::Bx,
+            4 => Reg16::Sp,
+            5 => Reg16::Bp,
+            6 => Reg16::Si,
+            7 => Reg16::Di,
+            _ => unreachable!("index & 0b111 is always in 0..=7"),
+        }
+    }
+
+    /// Decode a 2-bit segment-register field (bits 4-7 are reserved/
+    /// undefined on 8086/80186), as used by `MOV Sreg,r/m16` and
+    /// segment-register `PUSH`/`POP`.
+    pub fn segment_from_index(index: u8) -> Option<Reg16> {
+        match index & 0b111 {
+            0 => Some(Reg16::Es),
+            1 => Some(Reg16::Cs),
+            2 => Some(Reg16::Ss),
+            3 => Some(Reg16::Ds),
+            _ => None,
+        }
+    }
+}
+
+impl Reg8 {
+    /// Decode a 3-bit general-purpose register field into an 8-bit
+    /// register (the same field layout as `Reg16::from_index`, just
+    /// interpreted under `w=0`).
+    pub fn from_index(index: u8) -> Reg8 {
+        match index & 0b111 {
+            0 => Reg8::Al,
+            1 => Reg8::Cl,
+            2 => Reg8::Dl,
+            3 => Reg8::Bl,
+            4 => Reg8::Ah,
+            5 => Reg8::Ch,
+            6 => Reg8::Dh,
+            7 => Reg8::Bh,
+            _ => unreachable!("index & 0b111 is always in 0..=7"),
+        }
     }
 }
 
@@ -110,12 +284,68 @@ mod tests {
 
     #[test]
     fn instruction_can_be_constructed_with_no_operands() {
-        let hlt = Instruction {
-            mnemonic: Mnemonic::Hlt,
-            operands: vec![],
-            byte_len: Some(1),
-        };
+        let hlt = Instruction::new(Mnemonic::Hlt, vec![], None, 1);
         assert_eq!(hlt.mnemonic, Mnemonic::Hlt);
         assert!(hlt.operands.is_empty());
+    }
+
+    #[test]
+    fn reg16_from_index_matches_intel_encoding_table() {
+        let expected = [
+            (0, Reg16::Ax),
+            (1, Reg16::Cx),
+            (2, Reg16::Dx),
+            (3, Reg16::Bx),
+            (4, Reg16::Sp),
+            (5, Reg16::Bp),
+            (6, Reg16::Si),
+            (7, Reg16::Di),
+        ];
+        for (index, reg) in expected {
+            assert_eq!(Reg16::from_index(index), reg);
+        }
+    }
+
+    #[test]
+    fn reg8_from_index_matches_intel_encoding_table() {
+        let expected = [
+            (0, Reg8::Al),
+            (1, Reg8::Cl),
+            (2, Reg8::Dl),
+            (3, Reg8::Bl),
+            (4, Reg8::Ah),
+            (5, Reg8::Ch),
+            (6, Reg8::Dh),
+            (7, Reg8::Bh),
+        ];
+        for (index, reg) in expected {
+            assert_eq!(Reg8::from_index(index), reg);
+        }
+    }
+
+    #[test]
+    fn segment_from_index_covers_valid_range_and_rejects_the_rest() {
+        assert_eq!(Reg16::segment_from_index(0), Some(Reg16::Es));
+        assert_eq!(Reg16::segment_from_index(1), Some(Reg16::Cs));
+        assert_eq!(Reg16::segment_from_index(2), Some(Reg16::Ss));
+        assert_eq!(Reg16::segment_from_index(3), Some(Reg16::Ds));
+        assert_eq!(Reg16::segment_from_index(4), None);
+        assert_eq!(Reg16::segment_from_index(7), None);
+    }
+
+    #[test]
+    fn with_segment_override_only_affects_memory_operands() {
+        let mem = Operand::mem(Some(Reg16::Bx), None, 0).with_segment_override(Reg16::Es);
+        assert_eq!(
+            mem,
+            Operand::Memory {
+                segment_override: Some(Reg16::Es),
+                base: Some(Reg16::Bx),
+                index: None,
+                displacement: 0
+            }
+        );
+        let reg = Operand::Reg16(Reg16::Ax).with_segment_override(Reg16::Es);
+        assert_eq!(reg, Operand::Reg16(Reg16::Ax));
     }
 }

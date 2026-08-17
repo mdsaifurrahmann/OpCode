@@ -5,6 +5,12 @@
 //! since those are exercised directly by `x8086-interrupts` and
 //! `x8086-debugger` regardless of how much of the opcode table exists yet.
 
+mod execute;
+mod flags;
+mod operand;
+
+pub use execute::{execute, ExecutionEffect};
+
 use x8086_isa::{Flag, Reg16, Reg8};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
