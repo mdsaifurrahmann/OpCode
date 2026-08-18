@@ -1,16 +1,8 @@
 import SwiftUI
 
-private let defaultSample = """
-LEA DX, msg
-MOV AH, 9
-INT 21h
-HLT
-msg DB "Hello, x8086!$"
-"""
-
 struct ContentView: View {
-    @StateObject private var controller = EmulatorController()
-    @State private var sourceCode: String = defaultSample
+    @EnvironmentObject private var documentController: DocumentController
+    @EnvironmentObject private var controller: EmulatorController
     @State private var tokens: [Token] = []
     @State private var breakpointLines: Set<Int> = []
     @State private var scrollToLine: Int?
@@ -21,8 +13,12 @@ struct ContentView: View {
         VStack(spacing: 0) {
             DebuggerToolbar(
                 controller: controller,
-                onRun: { controller.run(source: sourceCode, breakpointLines: breakpointLines) },
-                onRestart: { controller.restart(source: sourceCode, breakpointLines: breakpointLines) },
+                onRun: {
+                    controller.run(source: documentController.sourceCode, breakpointLines: breakpointLines)
+                },
+                onRestart: {
+                    controller.restart(source: documentController.sourceCode, breakpointLines: breakpointLines)
+                },
                 onRunToCursor: {
                     if let address = selectedDisassemblyAddress {
                         controller.runToCursor(address: address)
@@ -46,11 +42,19 @@ struct ContentView: View {
             .frame(height: 220)
         }
         .frame(minWidth: 1150, minHeight: 760)
-        .onAppear { tokens = controller.tokenize(sourceCode) }
+        .navigationTitle(documentController.displayName)
+        .onAppear { tokens = controller.tokenize(documentController.sourceCode) }
         // One-parameter form: the two-parameter onChange(of:) overload
         // needs macOS 14+, and this project targets macOS 13.
-        .onChange(of: sourceCode) { newValue in
+        .onChange(of: documentController.sourceCode) { newValue in
             tokens = controller.tokenize(newValue)
+        }
+        .onChange(of: documentController.documentID) { _ in
+            // A whole new document replaced the editor's content - the
+            // old breakpoint/scroll state refers to a different file's
+            // line numbers and is meaningless here.
+            breakpointLines = []
+            scrollToLine = nil
         }
     }
 
@@ -58,7 +62,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Source").font(.headline)
             SourceEditorView(
-                text: $sourceCode,
+                text: $documentController.sourceCode,
                 breakpointLines: $breakpointLines,
                 scrollToLine: $scrollToLine,
                 tokens: tokens,
@@ -156,4 +160,6 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .environmentObject(DocumentController(initialSource: Samples.helloWorld.source))
+        .environmentObject(EmulatorController())
 }

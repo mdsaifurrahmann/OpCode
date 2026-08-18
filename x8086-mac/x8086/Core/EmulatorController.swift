@@ -45,6 +45,7 @@ final class EmulatorController: ObservableObject {
     @Published private(set) var registers: Registers
     @Published private(set) var diagnostics: [Diagnostic] = []
     @Published private(set) var lineToAddress: [LineAddress] = []
+    @Published private(set) var machineCodeLength: UInt32 = 0
     @Published private(set) var executionState: ExecutionState = .notLoaded
     @Published private(set) var canStepBack: Bool = false
     @Published private(set) var watches: [WatchValue] = []
@@ -216,6 +217,7 @@ final class EmulatorController: ObservableObject {
         let result = emulator.assembleAndLoad(source: source)
         diagnostics = result.diagnostics
         lineToAddress = result.lineToAddress
+        machineCodeLength = result.machineCodeLen
         syncBreakpoints(breakpointLines)
         executionState = diagnostics.contains(where: { $0.isError }) ? .notLoaded : .stopped
         refreshSnapshot()

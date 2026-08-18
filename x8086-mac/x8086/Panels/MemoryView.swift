@@ -12,8 +12,12 @@ struct MemoryView: View {
     @State private var editingText: String = ""
     @FocusState private var focusedAddress: UInt32?
 
-    private let bytesPerRow = 16
-    private let rowCount = 6
+    // 8 bytes/row (not the more traditional 16) so a row comfortably
+    // fits the narrow column this panel gets in the bottom split view -
+    // 16 wrapped its own address label mid-text when squeezed. More
+    // rows make up for the lost density.
+    private let bytesPerRow = 8
+    private let rowCount = 12
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -41,6 +45,7 @@ struct MemoryView: View {
         return HStack(spacing: 5) {
             Text(String(format: "%04X:", rowStart))
                 .foregroundColor(.secondary)
+                .fixedSize()
             ForEach(0..<bytes.count, id: \.self) { offset in
                 byteCell(address: rowStart &+ UInt32(offset), value: bytes[offset])
             }

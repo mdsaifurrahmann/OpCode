@@ -45,13 +45,16 @@ struct DebuggerToolbar: View {
             Divider().frame(height: 16)
 
             HStack(spacing: 4) {
-                Text("Speed").font(.caption).foregroundColor(.secondary)
+                Text("Speed")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize()
                 Slider(value: $controller.executionSpeed, in: 0...1)
                     .frame(width: 100)
                     .accessibilityIdentifier("speedSlider")
             }
 
-            Spacer()
+            Spacer(minLength: 0)
         }
         .padding(8)
     }
