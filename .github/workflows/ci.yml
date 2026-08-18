@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   # Job 1: gates every PR on Rust correctness without needing Xcode.
@@ -107,11 +108,47 @@ jobs:
         working-directory: x8086-mac
         run: xcodebuild -project x8086.xcodeproj -scheme x8086 -destination 'platform=macOS' -only-testing:x8086UITests test
 
-  # Job 5: codesign, notarize, and package a .dmg, then attach it to a
-  # GitHub Release. Only runs on version tags (v1.0.0 etc.), never on
-  # every push/PR like jobs 1-4 - a signing/notarization run costs real
-  # time and touches secrets, so it should be a deliberate act (pushing a
-  # tag), not something that fires on every commit.
+  # Job 5: builds an unsigned/ad-hoc .dmg - no secrets needed, since
+  # scripts/build-dmg-unsigned.sh only uses local ad-hoc signing. This is
+  # what actually ships a binary today, before Developer ID enrollment.
+  # Two ways to get one: push a `v*` tag (attaches the .dmg to that tag's
+  # GitHub Release), or trigger it manually from the Actions tab ("Run
+  # workflow") for an on-demand build without cutting a release.
+  build-dmg-unsigned:
+    name: Build unsigned .dmg
+    runs-on: macos-latest
+    needs: [rust-checks, xcode-unit-tests, xcode-e2e-tests]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build unsigned .dmg
+        run: ./scripts/build-dmg-unsigned.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpCode-unsigned-dmg
+          path: build/release-unsigned/OpCode-*.dmg
+
+      - name: Attach to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/release-unsigned/OpCode-*.dmg
+
+  # Job 6: codesign, notarize, and package a .dmg, then attach it to a
+  # GitHub Release - the properly signed replacement for job 5's output,
+  # once Developer ID enrollment happens. Skips cleanly (not a failure)
+  # until then, gated on whether the first secret it needs is set.
   #
   # Requires these repo secrets, none of which exist yet (see
   # scripts/release-dmg.sh's header for how to obtain each one):
@@ -127,15 +164,14 @@ jobs:
   #   NOTARIZATION_APP_PASSWORD      - an app-specific password for that
   #                                    Apple ID, from appleid.apple.com
   #                                    (not the Apple ID password itself)
-  # Until these are added under Settings > Secrets and variables > Actions,
-  # this job will fail immediately at the "Import signing certificate"
-  # step - expected, not a regression, until Developer ID enrollment
-  # happens.
+  # Add these under Settings > Secrets and variables > Actions and this
+  # job starts running automatically on the next tag - no workflow edit
+  # needed.
   release:
     name: Release (sign, notarize, package .dmg)
     runs-on: macos-latest
     needs: [rust-checks, xcode-unit-tests, xcode-e2e-tests]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && secrets.DEVELOPER_ID_CERTIFICATE_P12 != ''
     steps:
       - uses: actions/checkout@v4
 
