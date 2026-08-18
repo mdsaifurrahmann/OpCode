@@ -1,6 +1,17 @@
 import AppKit
 import SwiftUI
 
+/// An `NSTextView` with its own dedicated `UndoManager`, since a bare
+/// code-created `NSTextView` has neither `allowsUndo` nor a usable
+/// `undoManager` by default. This is necessary but not sufficient for
+/// Undo/Redo to work end to end - see `EditorUndoCoordinator` for why the
+/// Edit menu needs its own explicit commands rather than the automatic
+/// ones, and `bindUndoManager` below for how this manager reaches them.
+private final class UndoableTextView: NSTextView {
+    private let editorUndoManager = UndoManager()
+    override var undoManager: UndoManager? { editorUndoManager }
+}
+
 /// A code-aware editor panel: an `NSTextView` with tokenizer-driven
 /// syntax highlighting, inline diagnostic squiggles, and a line-number/
 /// breakpoint gutter - built directly on AppKit rather than a
@@ -17,11 +28,22 @@ struct SourceEditorView: NSViewRepresentable {
     var tokens: [Token]
     var diagnostics: [Diagnostic]
     var currentExecutionLine: Int?
+    /// Called once, right after the text view is created, with its
+    /// `UndoManager` - the caller hands this to `EditorUndoCoordinator`,
+    /// which the app's explicit Undo/Redo commands act on.
+    var bindUndoManager: (UndoManager?) -> Void = { _ in }
 
     func makeNSView(context: Context) -> NSView {
-        let textView = NSTextView()
+        let textView = UndoableTextView()
         textView.isRichText = false
         textView.isEditable = true
+        // NSTextView instances created in code (as opposed to loaded from
+        // a NIB, where Interface Builder sets this to true) default to
+        // `false` here - without it, the view never calls into
+        // `undoManager` to register typing edits in the first place, so
+        // the dedicated `UndoManager` above sits permanently empty no
+        // matter how it's vended.
+        textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
@@ -64,6 +86,12 @@ struct SourceEditorView: NSViewRepresentable {
         context.coordinator.gutterView = gutter
         context.coordinator.applyHighlighting(tokens: tokens)
 
+        // Deferred: this runs during SwiftUI's view-building phase, and
+        // `bindUndoManager` typically writes to `@Published`/`@State` on
+        // the caller's side - mutating that synchronously from inside
+        // `makeNSView` triggers "Modifying state during view update".
+        DispatchQueue.main.async { bindUndoManager(textView.undoManager) }
+
         // The gutter is a plain NSView, not an NSRulerView, so nothing
         // repositions or redraws it automatically as the text view
         // scrolls or its content reflows - these two notifications cover
@@ -81,6 +109,13 @@ struct SourceEditorView: NSViewRepresentable {
 
         if textView.string != text {
             textView.string = text
+            // This branch only runs when *something other than the user
+            // typing* replaced the whole document (New/Open/Open Recent/
+            // Open Sample - ordinary edits already match `text` by the
+            // time this runs, via `textDidChange` updating the binding
+            // first) - undo history from the previous file has no
+            // business surviving into a different one.
+            textView.undoManager?.removeAllActions()
         }
         context.coordinator.applyHighlighting(tokens: tokens)
         context.coordinator.applySquiggles(diagnostics: diagnostics, tokens: tokens)

@@ -1,9 +1,11 @@
+import AppKit
 import SwiftUI
 
 @main
 struct X8086App: App {
     @StateObject private var documentController = DocumentController(initialSource: Samples.helloWorld.source)
     @StateObject private var emulatorController = EmulatorController()
+    @StateObject private var editorUndoCoordinator = EditorUndoCoordinator()
     @Environment(\.openWindow) private var openWindow
 
     init() {
@@ -31,8 +33,36 @@ struct X8086App: App {
             ContentView()
                 .environmentObject(documentController)
                 .environmentObject(emulatorController)
+                .environmentObject(editorUndoCoordinator)
+                // Fires when the app is asked to open a file - double-
+                // clicking a .asm file in Finder, dragging one onto the
+                // Dock icon, or "Open With" (all now possible thanks to
+                // the CFBundleDocumentTypes registration in project.yml).
+                // Reuses the exact same load path as File > Open.
+                .onOpenURL { url in
+                    documentController.openURL(url)
+                    closeDuplicateMainWindows()
+                }
         }
         .commands {
+            // Replaces the system-automatic Undo/Redo commands, which
+            // read a `\.undoManager` environment value this app (a plain
+            // `WindowGroup`, not `DocumentGroup`) has no supported way to
+            // populate - see `EditorUndoCoordinator` for the full story
+            // on why they'd otherwise stay permanently disabled.
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") {
+                    editorUndoCoordinator.undo()
+                }
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(!editorUndoCoordinator.canUndo)
+
+                Button("Redo") {
+                    editorUndoCoordinator.redo()
+                }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+                .disabled(!editorUndoCoordinator.canRedo)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("New") {
                     documentController.newDocument(defaultSource: Samples.helloWorld.source)
@@ -106,6 +136,27 @@ struct X8086App: App {
             AsciiTableView()
         }
         .defaultSize(width: 420, height: 480)
+    }
+
+    /// `documentController` is one shared object for the whole app - a
+    /// second main window is never showing a different document, just
+    /// the identical state a moment later, which makes it pure clutter,
+    /// not a real second document. But the system's file-open event (the
+    /// path `.onOpenURL` runs on) hands a `WindowGroup` app a *new*
+    /// window before this code ever runs, since `WindowGroup` supports
+    /// multiple windows by default. This closes every other main editor
+    /// window after a file loads, leaving only the one that just
+    /// received it - a plain-size check (`contentMinSize.width >= 1000`)
+    /// distinguishes it from the much smaller Number Converter/ASCII
+    /// Table utility windows, which are meant to coexist and multiply.
+    private func closeDuplicateMainWindows() {
+        DispatchQueue.main.async {
+            let mainWindows = NSApp.windows.filter { $0.contentMinSize.width >= 1000 }
+            guard mainWindows.count > 1, let keep = NSApp.keyWindow ?? mainWindows.last else { return }
+            for window in mainWindows where window !== keep {
+                window.close()
+            }
+        }
     }
 
     /// Builds the current listing text - requires the program to have

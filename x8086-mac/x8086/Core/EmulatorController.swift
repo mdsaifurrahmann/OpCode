@@ -59,6 +59,11 @@ final class EmulatorController: ObservableObject {
     @Published var executionSpeed: Double = 1.0
 
     private var runTask: Task<Void, Never>?
+    /// The exact source text behind whatever's currently loaded - `run`
+    /// compares against this to tell "resume where we paused" apart from
+    /// "the user edited code since we last assembled," which both look
+    /// identical to `executionState` alone.
+    private var lastAssembledSource: String?
 
     private let disassemblyWindowSize: UInt32 = 40
     private let stackWindowSize: UInt32 = 16
@@ -96,11 +101,23 @@ final class EmulatorController: ObservableObject {
     // MARK: - Run / Pause / Restart / Step
 
     /// Starts a fresh debug session (assemble, load, sync breakpoints,
-    /// run to the first stop) or, if one is already loaded and paused,
-    /// simply continues it - the same "Run" gesture serves both roles in
-    /// every mainstream debugger, emu8086 included.
+    /// run to the first stop) or, if one is already loaded, paused, and
+    /// *unedited since*, simply continues it - the same "Run" gesture
+    /// serves both roles in every mainstream debugger, emu8086 included.
+    ///
+    /// The "unedited since" check matters: `.stopped` also covers a
+    /// breakpoint pause, a user-initiated Pause, and a freshly-loaded
+    /// session, all of which look identical to this method. Gating the
+    /// resume-vs-reassemble choice on `executionState` alone (as this
+    /// used to) meant editing source after any of those and hitting Run
+    /// silently kept executing the *previous* machine code - reassembly
+    /// only happened after an explicit Restart. Comparing against
+    /// `lastAssembledSource` catches every case where the two have
+    /// actually diverged, while still resuming normally (not restarting
+    /// from scratch) when the user pauses mid-run without changing
+    /// anything.
     func run(source: String, breakpointLines: Set<Int>) {
-        if executionState == .stopped {
+        if executionState == .stopped && source == lastAssembledSource {
             startLoop { [emulator] chunkSize in emulator.run(maxSteps: chunkSize) }
             return
         }
@@ -219,6 +236,7 @@ final class EmulatorController: ObservableObject {
         runTask?.cancel()
         consoleOutput = ""
         diagnostics = []
+        lastAssembledSource = source
 
         let result = emulator.assembleAndLoad(source: source)
         diagnostics = result.diagnostics
@@ -266,28 +284,58 @@ final class EmulatorController: ObservableObject {
         return (chunkSize, delayNanoseconds)
     }
 
+    /// Total instructions a single Run/Step Over/Run to Here gesture may
+    /// execute before it's treated as a runaway program (almost always a
+    /// missing `HLT`/`INT 21h,4Ch`) rather than a real computation - see
+    /// `handleChunkOutcome`. Confirmed live at 20,000,000: correct (a
+    /// clear diagnostic, no crash, bounded memory), but the *combined*
+    /// per-chunk overhead - not raw instruction throughput, which is much
+    /// higher in isolation - stretched that out to closer to a minute,
+    /// long enough to look like a hang rather than a safety net kicking
+    /// in. 3,000,000 lands the same guarantee in a few seconds while
+    /// still leaving enormous headroom over anything an educational
+    /// assembly program legitimately needs.
+    private static let maxTotalStepsPerRun: UInt64 = 3_000_000
+    private var totalStepsThisRun: UInt64 = 0
+
     private func startLoop(_ step: @escaping (UInt32) -> RunResult) {
         executionState = .running
+        totalStepsThisRun = 0
         runTask?.cancel()
         runTask = Task.detached(priority: .userInitiated) { [weak self] in
             while true {
                 if Task.isCancelled { break }
                 guard let parameters = await self?.currentChunkParameters() else { break }
                 let outcome = step(parameters.chunkSize)
-                let shouldContinue = await self?.handleChunkOutcome(outcome) ?? false
+                let shouldContinue = await self?.handleChunkOutcome(outcome, chunkSize: parameters.chunkSize) ?? false
                 if !shouldContinue { break }
-                if parameters.delayNanoseconds > 0 {
-                    try? await Task.sleep(nanoseconds: parameters.delayNanoseconds)
-                }
+                // Always yield some real wall-clock time back to the run
+                // loop between chunks, not only when `executionSpeed`
+                // calls for a visible animation delay. Chunk after chunk
+                // of MainActor work with zero pause between them can
+                // starve SwiftUI's own rendering pass indefinitely -
+                // observed as a multi-second-long runaway program
+                // showing a frozen "Running…" screen with no console
+                // output ever appearing, even though state was actually
+                // updating correctly the whole time. This floor is
+                // skipped entirely for the overwhelmingly common case (a
+                // normal program halts within its first chunk, so the
+                // loop already `break`s above before reaching this line).
+                try? await Task.sleep(nanoseconds: max(parameters.delayNanoseconds, 1_000_000))
             }
             await self?.finalizeLoopIfStillRunning()
         }
     }
 
     /// Publishes a snapshot for this chunk and applies its outcome.
-    /// Returns whether the loop should keep going - only `stepLimitReached`
-    /// (a runaway-program ceiling, not a real stopping condition) does.
-    private func handleChunkOutcome(_ outcome: RunResult) -> Bool {
+    /// Returns whether the loop should keep going - `stepLimitReached`
+    /// (the chunk's own ceiling, purely a cooperative-cancellation/UI-
+    /// refresh cadence, not a real stopping condition) does, unless the
+    /// *cumulative* total across every chunk this run has crossed
+    /// `maxTotalStepsPerRun`, in which case this is very likely an
+    /// infinite loop and the run stops with a diagnostic explaining why,
+    /// exactly like a decode error would.
+    private func handleChunkOutcome(_ outcome: RunResult, chunkSize: UInt32) -> Bool {
         refreshSnapshot()
         switch outcome {
         case .halted:
@@ -304,6 +352,17 @@ final class EmulatorController: ObservableObject {
             executionState = .stopped
             return false
         case .stepLimitReached:
+            totalStepsThisRun += UInt64(chunkSize)
+            if totalStepsThisRun >= Self.maxTotalStepsPerRun {
+                diagnostics.append(
+                    Diagnostic(
+                        line: 0, col: 0, isError: true,
+                        message:
+                            "Stopped after \(Self.maxTotalStepsPerRun) instructions without halting - this program likely has an infinite loop (check for a missing HLT or INT 21h, AH=4Ch)."
+                    ))
+                executionState = .stopped
+                return false
+            }
             return true
         }
     }

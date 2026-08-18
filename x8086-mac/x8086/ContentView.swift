@@ -3,10 +3,10 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject private var documentController: DocumentController
     @EnvironmentObject private var controller: EmulatorController
+    @EnvironmentObject private var undoCoordinator: EditorUndoCoordinator
     @State private var tokens: [Token] = []
     @State private var breakpointLines: Set<Int> = []
     @State private var scrollToLine: Int?
-    @State private var keyboardInput: String = ""
     @State private var selectedDisassemblyAddress: UInt32?
 
     var body: some View {
@@ -67,7 +67,8 @@ struct ContentView: View {
                 scrollToLine: $scrollToLine,
                 tokens: tokens,
                 diagnostics: controller.diagnostics,
-                currentExecutionLine: controller.currentExecutionLine
+                currentExecutionLine: controller.currentExecutionLine,
+                bindUndoManager: { undoCoordinator.undoManager = $0 }
             )
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
 
@@ -122,26 +123,11 @@ struct ContentView: View {
     }
 
     private var outputPane: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Console").font(.headline)
-            ScrollView {
-                Text(controller.consoleOutput)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("consoleOutputLabel")
-            }
-            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
-
-            if controller.isWaitingForKeyboard {
-                HStack {
-                    TextField("keystroke", text: $keyboardInput)
-                        .accessibilityIdentifier("keyboardInputField")
-                        .frame(width: 80)
-                        .onSubmit(sendKeyboardInput)
-                    Text("waiting for keyboard input").foregroundColor(.secondary)
-                }
-            }
-        }
+        ConsoleView(
+            output: controller.consoleOutput,
+            isWaitingForKeyboard: controller.isWaitingForKeyboard,
+            onKey: controller.sendKey
+        )
         .padding()
         .frame(minWidth: 300)
     }
@@ -149,17 +135,11 @@ struct ContentView: View {
     private func sectionHeader(_ title: String) -> some View {
         Text(title).font(.subheadline).bold()
     }
-
-    private func sendKeyboardInput() {
-        if let character = keyboardInput.first {
-            controller.sendKey(character)
-        }
-        keyboardInput = ""
-    }
 }
 
 #Preview {
     ContentView()
         .environmentObject(DocumentController(initialSource: Samples.helloWorld.source))
         .environmentObject(EmulatorController())
+        .environmentObject(EditorUndoCoordinator())
 }

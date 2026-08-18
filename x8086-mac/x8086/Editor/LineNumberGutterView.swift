@@ -56,6 +56,18 @@ final class LineNumberGutterView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let textView, let layoutManager = textView.layoutManager, let textContainer = textView.textContainer else { return }
 
+        // A redraw triggered mid-scroll (see `SourceEditorView`'s bounds-
+        // change observer) computes line rects for the *new* scroll
+        // position, which can briefly fall just outside `bounds` before
+        // the next layout pass catches up. Clipping the graphics context
+        // itself (rather than relying on layer masking, which turned out
+        // to suppress this view's drawing entirely under SwiftUI's
+        // hosting) guarantees nothing painted below ever escapes the
+        // gutter's own rectangle, regardless of backing-store details.
+        NSGraphicsContext.current?.saveGraphicsState()
+        defer { NSGraphicsContext.current?.restoreGraphicsState() }
+        NSBezierPath(rect: bounds).addClip()
+
         NSColor.controlBackgroundColor.setFill()
         dirtyRect.fill()
 
