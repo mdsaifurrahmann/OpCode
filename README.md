@@ -1,3 +1,7 @@
+<p align="center">
+<img width="889" height="500" alt="Screenshot 2026-08-19 at 4 36 55 AM" src="https://github.com/user-attachments/assets/094eade2-ebc6-4ddf-8aec-7b6e84b16648" />
+</p>   
+
 # OpCode
 
 A native macOS 8086/80186 assembler, emulator, and debugger - an emu8086-style teaching tool for x86 assembly language, built from scratch for the Mac.
