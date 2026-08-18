@@ -50,6 +50,29 @@ pub enum RunOutcome {
     StepLimitReached,
 }
 
+/// Caps how much text `ConsoleSink` will ever hold. A print/teletype
+/// loop missing its terminating `HLT`/`INT 21h,4Ch` is a common beginner
+/// mistake, and every character it prints flows straight into `output`
+/// with nothing else in this crate to stop it - `Emulator::run`'s
+/// `max_steps` is a per-call chunk size, not a total ceiling, so an
+/// interactive caller that keeps calling `run` again (as the Swift run
+/// loop does, precisely so long programs stay responsive) would
+/// otherwise let this string grow without bound.
+///
+/// The cap has to stay small, not just finite: the Swift side publishes
+/// a fresh copy of the whole string to a `Text` view on every chunk
+/// while a program runs, and re-laying-out hundreds of KB of text on
+/// every publish is itself slow enough to visibly stall the UI (worse,
+/// it stalls the very `MainActor` hop the run loop needs to keep
+/// checking its own step ceiling and Pause cancellation, compounding
+/// the problem) - confirmed live: capping at 1MB let a runaway print
+/// loop peg the app for the better part of a minute even though the
+/// instruction-count ceiling should have stopped it in a couple of
+/// seconds. 20,000 characters is still hundreds of lines - far more
+/// than any real console output needs - while keeping every single
+/// render cheap.
+const MAX_CONSOLE_OUTPUT_LEN: usize = 20_000;
+
 /// In-memory `IoSink`: accumulates console output as plain text and
 /// holds at most one pending keystroke. This is what a real UI (or a
 /// test) drives directly - `console_write`/`console_clear` model what
@@ -59,14 +82,33 @@ pub enum RunOutcome {
 struct ConsoleSink {
     output: String,
     pending_key: Option<(u8, u8)>,
+    /// Set once `output` hits `MAX_CONSOLE_OUTPUT_LEN`, so the one-time
+    /// truncation notice itself is never re-appended or trimmed away.
+    truncated: bool,
 }
 
 impl IoSink for ConsoleSink {
     fn console_write(&mut self, text: &str) {
-        self.output.push_str(text);
+        if self.truncated {
+            return;
+        }
+        if self.output.len() + text.len() <= MAX_CONSOLE_OUTPUT_LEN {
+            self.output.push_str(text);
+            return;
+        }
+        let remaining = MAX_CONSOLE_OUTPUT_LEN.saturating_sub(self.output.len());
+        let mut boundary = remaining.min(text.len());
+        while boundary > 0 && !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        self.output.push_str(&text[..boundary]);
+        self.output
+            .push_str("\n[Output truncated - program produced too much text without halting]");
+        self.truncated = true;
     }
     fn console_clear(&mut self) {
         self.output.clear();
+        self.truncated = false;
     }
     fn read_key(&mut self) -> Option<(u8, u8)> {
         self.pending_key.take()
@@ -863,6 +905,51 @@ HLT
         let mut emulator = Emulator::new();
         emulator.load_program(&[0xEB, 0xFE]); // JMP $ (short jump to self)
         assert_eq!(emulator.run(50), RunOutcome::StepLimitReached);
+    }
+
+    #[test]
+    fn console_sink_caps_output_length_and_appends_truncation_notice() {
+        let mut sink = ConsoleSink::default();
+        // One write already past the cap, to exercise the truncating
+        // branch directly rather than needing a million individual calls.
+        sink.console_write(&"x".repeat(MAX_CONSOLE_OUTPUT_LEN + 500));
+        assert!(sink.truncated);
+        assert!(
+            sink.output.len() < MAX_CONSOLE_OUTPUT_LEN + 200,
+            "must not keep the extra 500 characters past the cap"
+        );
+        assert!(sink
+            .output
+            .ends_with("[Output truncated - program produced too much text without halting]"));
+
+        let len_before = sink.output.len();
+        sink.console_write("more text a runaway loop would print");
+        assert_eq!(
+            sink.output.len(),
+            len_before,
+            "once truncated, further writes must be dropped, not appended"
+        );
+    }
+
+    #[test]
+    fn console_sink_truncation_never_splits_a_multi_byte_utf8_character() {
+        // Fill to exactly one byte short of the cap, then write a 3-byte
+        // UTF-8 character (e.g. a CP437-mapped box-drawing glyph) that
+        // straddles the boundary - the truncation point must back up to
+        // a valid char boundary rather than slicing mid-character, which
+        // would panic.
+        let mut sink = ConsoleSink {
+            output: "x".repeat(MAX_CONSOLE_OUTPUT_LEN - 1),
+            ..Default::default()
+        };
+        sink.console_write("\u{2554}"); // '╔', 3 bytes in UTF-8
+                                        // The real test is that the slice above didn't panic (Rust
+                                        // string-slicing on a non-boundary index panics); this just
+                                        // additionally confirms the truncation notice is intact.
+        assert!(sink.truncated);
+        assert!(sink
+            .output
+            .ends_with("[Output truncated - program produced too much text without halting]"));
     }
 
     #[test]

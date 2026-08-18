@@ -13,6 +13,8 @@
 //! see `InterruptOutcome::NeedsKeyboardInput` below for how that's
 //! handled without this crate needing to know anything about threads.
 
+mod cp437;
+
 use x8086_cpu::Registers;
 use x8086_memory::Memory;
 
@@ -63,7 +65,7 @@ fn handle_video_service(regs: &mut Registers, io: &mut dyn IoSink) -> InterruptO
         // AH=0Eh: teletype output - print AL, advance the cursor.
         0x0E => {
             let al = regs.ax as u8;
-            io.console_write(&(al as char).to_string());
+            io.console_write(&cp437::to_char(al).to_string());
             InterruptOutcome::Continue
         }
         _ => InterruptOutcome::Continue,
@@ -96,7 +98,7 @@ fn handle_dos_service(
         0x01 => match io.read_key() {
             Some((_, ascii)) => {
                 regs.ax = (regs.ax & 0xFF00) | ascii as u16;
-                io.console_write(&(ascii as char).to_string());
+                io.console_write(&cp437::to_char(ascii).to_string());
                 InterruptOutcome::Continue
             }
             None => InterruptOutcome::NeedsKeyboardInput,
@@ -104,7 +106,7 @@ fn handle_dos_service(
         // AH=02h: print the character in DL.
         0x02 => {
             let dl = regs.dx as u8;
-            io.console_write(&(dl as char).to_string());
+            io.console_write(&cp437::to_char(dl).to_string());
             InterruptOutcome::Continue
         }
         // AH=09h: print the '$'-terminated string at DS:DX.
@@ -113,10 +115,10 @@ fn handle_dos_service(
             let mut text = String::new();
             loop {
                 let byte = memory.read_u8(addr);
-                if byte as char == '$' {
+                if byte == b'$' {
                     break;
                 }
-                text.push(byte as char);
+                text.push(cp437::to_char(byte));
                 addr = addr.wrapping_add(1);
             }
             io.console_write(&text);
