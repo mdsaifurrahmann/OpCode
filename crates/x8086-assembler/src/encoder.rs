@@ -5,7 +5,7 @@
 //! encoding) - correctness and simplicity over code-size optimization,
 //! which nothing in this project needs yet.
 
-use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Width};
+use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Repeat, Width};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodeError(pub String);
@@ -59,8 +59,151 @@ pub fn encode_one(instr: &Instruction) -> Result<Vec<u8>, EncodeError> {
         Mnemonic::Std => Ok(vec![0xFD]),
         Mnemonic::Cli => Ok(vec![0xFA]),
         Mnemonic::Sti => Ok(vec![0xFB]),
+        Mnemonic::Shl
+        | Mnemonic::Shr
+        | Mnemonic::Sar
+        | Mnemonic::Rol
+        | Mnemonic::Ror
+        | Mnemonic::Rcl
+        | Mnemonic::Rcr => encode_shift_rotate(instr),
+        Mnemonic::Mul
+        | Mnemonic::Imul
+        | Mnemonic::Div
+        | Mnemonic::Idiv
+        | Mnemonic::Not
+        | Mnemonic::Neg => encode_unary(instr),
+        Mnemonic::Movsb
+        | Mnemonic::Movsw
+        | Mnemonic::Cmpsb
+        | Mnemonic::Cmpsw
+        | Mnemonic::Stosb
+        | Mnemonic::Stosw
+        | Mnemonic::Lodsb
+        | Mnemonic::Lodsw
+        | Mnemonic::Scasb
+        | Mnemonic::Scasw => encode_string(instr),
         Mnemonic::Unknown => Err(EncodeError::new("cannot encode Mnemonic::Unknown")),
     }
+}
+
+// --- shift/rotate group (D0-D3, C0-C1) ---------------------------------
+
+fn shift_rotate_reg_field(mnemonic: Mnemonic) -> u8 {
+    match mnemonic {
+        Mnemonic::Rol => 0,
+        Mnemonic::Ror => 1,
+        Mnemonic::Rcl => 2,
+        Mnemonic::Rcr => 3,
+        Mnemonic::Shl => 4,
+        Mnemonic::Shr => 5,
+        Mnemonic::Sar => 7,
+        other => unreachable!(
+            "encode_shift_rotate only dispatches for the shift/rotate group, got {other:?}"
+        ),
+    }
+}
+
+fn encode_shift_rotate(instr: &Instruction) -> Result<Vec<u8>, EncodeError> {
+    let width = instr
+        .width
+        .ok_or_else(|| EncodeError::new("shift/rotate instruction is missing a width"))?;
+    let dst = &instr.operands[0];
+    let reg_field = shift_rotate_reg_field(instr.mnemonic);
+    let count = instr
+        .operands
+        .get(1)
+        .ok_or_else(|| EncodeError::new("shift/rotate instruction requires a count operand"))?;
+    match count {
+        Operand::Immediate(1) => {
+            let opcode = match width {
+                Width::Byte => 0xD0,
+                Width::Word => 0xD1,
+            };
+            let mut bytes = vec![opcode];
+            bytes.extend(encode_rm(reg_field, dst, width)?);
+            Ok(bytes)
+        }
+        Operand::Reg8(Reg8::Cl) => {
+            let opcode = match width {
+                Width::Byte => 0xD2,
+                Width::Word => 0xD3,
+            };
+            let mut bytes = vec![opcode];
+            bytes.extend(encode_rm(reg_field, dst, width)?);
+            Ok(bytes)
+        }
+        Operand::Immediate(n) => {
+            // The 80186 immediate-count form - real 8086 only has the
+            // implicit-1 and CL forms above.
+            let opcode = match width {
+                Width::Byte => 0xC0,
+                Width::Word => 0xC1,
+            };
+            let mut bytes = vec![opcode];
+            bytes.extend(encode_rm(reg_field, dst, width)?);
+            with_immediate(bytes, *n, Width::Byte)
+        }
+        other => Err(EncodeError::new(format!(
+            "invalid shift/rotate count operand {other:?} - must be 1, CL, or an immediate"
+        ))),
+    }
+}
+
+// --- F6/F7 unary group (MUL/IMUL/DIV/IDIV/NEG/NOT) ----------------------
+
+fn unary_group_reg_field(mnemonic: Mnemonic) -> u8 {
+    match mnemonic {
+        Mnemonic::Not => 2,
+        Mnemonic::Neg => 3,
+        Mnemonic::Mul => 4,
+        Mnemonic::Imul => 5,
+        Mnemonic::Div => 6,
+        Mnemonic::Idiv => 7,
+        other => unreachable!("encode_unary only dispatches for the F6/F7 group, got {other:?}"),
+    }
+}
+
+fn encode_unary(instr: &Instruction) -> Result<Vec<u8>, EncodeError> {
+    let width = instr
+        .width
+        .ok_or_else(|| EncodeError::new("instruction is missing a width"))?;
+    let opcode = match width {
+        Width::Byte => 0xF6,
+        Width::Word => 0xF7,
+    };
+    let reg_field = unary_group_reg_field(instr.mnemonic);
+    let mut bytes = vec![opcode];
+    bytes.extend(encode_rm(reg_field, &instr.operands[0], width)?);
+    Ok(bytes)
+}
+
+// --- string instructions + REP/REPE/REPNE prefix ------------------------
+
+fn string_opcode(mnemonic: Mnemonic) -> u8 {
+    match mnemonic {
+        Mnemonic::Movsb => 0xA4,
+        Mnemonic::Movsw => 0xA5,
+        Mnemonic::Cmpsb => 0xA6,
+        Mnemonic::Cmpsw => 0xA7,
+        Mnemonic::Stosb => 0xAA,
+        Mnemonic::Stosw => 0xAB,
+        Mnemonic::Lodsb => 0xAC,
+        Mnemonic::Lodsw => 0xAD,
+        Mnemonic::Scasb => 0xAE,
+        Mnemonic::Scasw => 0xAF,
+        other => unreachable!("encode_string only dispatches for string mnemonics, got {other:?}"),
+    }
+}
+
+fn encode_string(instr: &Instruction) -> Result<Vec<u8>, EncodeError> {
+    let mut bytes = Vec::new();
+    match instr.repeat {
+        Some(Repeat::Rep) | Some(Repeat::Repe) => bytes.push(0xF3),
+        Some(Repeat::Repne) => bytes.push(0xF2),
+        None => {}
+    }
+    bytes.push(string_opcode(instr.mnemonic));
+    Ok(bytes)
 }
 
 // --- shared low-level helpers -----------------------------------------------
@@ -265,7 +408,7 @@ fn immediate_operand_value(operand: &Operand) -> Result<i32, EncodeError> {
     }
 }
 
-fn condition_index(condition: Condition) -> u8 {
+pub(crate) fn condition_index(condition: Condition) -> u8 {
     match condition {
         Condition::Overflow => 0x0,
         Condition::NotOverflow => 0x1,
@@ -643,6 +786,10 @@ mod tests {
             decoded.width, instr.width,
             "width mismatch after round-trip for {instr:?}, got bytes {bytes:02x?}"
         );
+        assert_eq!(
+            decoded.repeat, instr.repeat,
+            "repeat-prefix mismatch after round-trip for {instr:?}, got bytes {bytes:02x?}"
+        );
     }
 
     fn instr(mnemonic: Mnemonic, operands: Vec<Operand>, width: Option<Width>) -> Instruction {
@@ -1007,5 +1154,143 @@ mod tests {
             Some(Width::Byte),
         );
         assert!(encode_one(&i).is_err());
+    }
+
+    // --- shift/rotate group -------------------------------------------
+
+    #[test]
+    fn shift_by_one_encodes_as_d0_d1_and_round_trips() {
+        assert_round_trips(instr(
+            Mnemonic::Shl,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)],
+            Some(Width::Byte),
+        ));
+        let i = instr(
+            Mnemonic::Sar,
+            vec![Operand::Reg16(Reg16::Dx), Operand::Immediate(1)],
+            Some(Width::Word),
+        );
+        assert_eq!(encode_one(&i).unwrap()[0], 0xD1);
+        assert_round_trips(i);
+    }
+
+    #[test]
+    fn shift_by_cl_encodes_as_d2_d3_and_round_trips() {
+        let i = instr(
+            Mnemonic::Rol,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        assert_eq!(encode_one(&i).unwrap()[0], 0xD2);
+        assert_round_trips(i);
+    }
+
+    #[test]
+    fn shift_by_immediate_encodes_as_the_80186_c0_c1_form_and_round_trips() {
+        let i = instr(
+            Mnemonic::Rcr,
+            vec![Operand::Reg16(Reg16::Bx), Operand::Immediate(5)],
+            Some(Width::Word),
+        );
+        let bytes = encode_one(&i).unwrap();
+        assert_eq!(bytes[0], 0xC1);
+        assert_round_trips(i);
+    }
+
+    #[test]
+    fn all_eight_shift_rotate_reg_field_forms_round_trip() {
+        for mnemonic in [
+            Mnemonic::Rol,
+            Mnemonic::Ror,
+            Mnemonic::Rcl,
+            Mnemonic::Rcr,
+            Mnemonic::Shl,
+            Mnemonic::Shr,
+            Mnemonic::Sar,
+        ] {
+            assert_round_trips(instr(
+                mnemonic,
+                vec![Operand::Reg16(Reg16::Ax), Operand::Immediate(1)],
+                Some(Width::Word),
+            ));
+        }
+    }
+
+    // --- F6/F7 unary group ----------------------------------------------
+
+    #[test]
+    fn mul_imul_div_idiv_neg_not_round_trip() {
+        for mnemonic in [
+            Mnemonic::Mul,
+            Mnemonic::Imul,
+            Mnemonic::Div,
+            Mnemonic::Idiv,
+            Mnemonic::Neg,
+            Mnemonic::Not,
+        ] {
+            assert_round_trips(instr(
+                mnemonic,
+                vec![Operand::Reg16(Reg16::Bx)],
+                Some(Width::Word),
+            ));
+            assert_round_trips(instr(
+                mnemonic,
+                vec![Operand::Reg8(Reg8::Bl)],
+                Some(Width::Byte),
+            ));
+        }
+    }
+
+    #[test]
+    fn div_memory_operand_round_trips() {
+        assert_round_trips(instr(
+            Mnemonic::Div,
+            vec![Operand::mem(Some(Reg16::Bx), None, 0)],
+            Some(Width::Word),
+        ));
+    }
+
+    // --- string instructions + REP prefix --------------------------------
+
+    #[test]
+    fn all_ten_string_instructions_round_trip() {
+        for mnemonic in [
+            Mnemonic::Movsb,
+            Mnemonic::Movsw,
+            Mnemonic::Cmpsb,
+            Mnemonic::Cmpsw,
+            Mnemonic::Stosb,
+            Mnemonic::Stosw,
+            Mnemonic::Lodsb,
+            Mnemonic::Lodsw,
+            Mnemonic::Scasb,
+            Mnemonic::Scasw,
+        ] {
+            assert_round_trips(instr(mnemonic, vec![], None));
+        }
+    }
+
+    #[test]
+    fn rep_movsb_encodes_with_the_f3_prefix_byte_and_round_trips() {
+        let i = instr(Mnemonic::Movsb, vec![], None).with_repeat(Repeat::Rep);
+        let bytes = encode_one(&i).unwrap();
+        assert_eq!(bytes, vec![0xF3, 0xA4]);
+        assert_round_trips(i);
+    }
+
+    #[test]
+    fn repe_cmpsb_encodes_with_the_f3_prefix_byte_and_round_trips_as_repe() {
+        let i = instr(Mnemonic::Cmpsb, vec![], None).with_repeat(Repeat::Repe);
+        let bytes = encode_one(&i).unwrap();
+        assert_eq!(bytes, vec![0xF3, 0xA6]);
+        assert_round_trips(i);
+    }
+
+    #[test]
+    fn repne_scasb_encodes_with_the_f2_prefix_byte_and_round_trips() {
+        let i = instr(Mnemonic::Scasb, vec![], None).with_repeat(Repeat::Repne);
+        let bytes = encode_one(&i).unwrap();
+        assert_eq!(bytes, vec![0xF2, 0xAE]);
+        assert_round_trips(i);
     }
 }

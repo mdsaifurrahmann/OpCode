@@ -128,7 +128,46 @@ pub enum Mnemonic {
     Std,
     Cli,
     Sti,
+    // Shift/rotate group (D0-D3, C0-C1)
+    Shl,
+    Shr,
+    Sar,
+    Rol,
+    Ror,
+    Rcl,
+    Rcr,
+    // Unary group (F6/F7)
+    Mul,
+    Imul,
+    Div,
+    Idiv,
+    Neg,
+    Not,
+    // String instructions (implicit DS:SI / ES:DI operands)
+    Movsb,
+    Movsw,
+    Cmpsb,
+    Cmpsw,
+    Stosb,
+    Stosw,
+    Lodsb,
+    Lodsw,
+    Scasb,
+    Scasw,
     Unknown,
+}
+
+/// The `REP`/`REPE`/`REPNE` string-instruction prefix. Encodes as a single
+/// byte (`0xF3` for `Rep`/`Repe`, `0xF2` for `Repne`) - which of the two
+/// meanings `0xF3` carries depends on the trailing string opcode (an
+/// unconditional repeat count for MOVS/STOS/LODS, a "while ZF" repeat for
+/// CMPS/SCAS), which is why `Rep` and `Repe` are kept as distinct variants
+/// here even though they share an encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Repeat {
+    Rep,
+    Repe,
+    Repne,
 }
 
 /// An operand to an instruction: a register, an immediate value, or a
@@ -197,6 +236,10 @@ pub struct Instruction {
     pub width: Option<Width>,
     /// Length in bytes once encoded/decoded.
     pub byte_len: u8,
+    /// A `REP`/`REPE`/`REPNE` prefix, only meaningful on the string
+    /// instructions. `None` for every other mnemonic and for a
+    /// non-repeated string instruction.
+    pub repeat: Option<Repeat>,
 }
 
 impl Instruction {
@@ -211,7 +254,13 @@ impl Instruction {
             operands,
             width,
             byte_len,
+            repeat: None,
         }
+    }
+
+    pub fn with_repeat(mut self, repeat: Repeat) -> Self {
+        self.repeat = Some(repeat);
+        self
     }
 }
 

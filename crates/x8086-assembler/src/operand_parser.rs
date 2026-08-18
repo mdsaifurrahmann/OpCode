@@ -60,17 +60,41 @@ fn is_keyword(tok: &Token, keyword: &str) -> bool {
 }
 
 pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand, ParseError> {
+    // `OFFSET expr` always means "the address," full stop - regardless
+    // of what a *bare* reference to the same expression would otherwise
+    // mean (see `ParsedExpr::Offset`'s docs for why that's not always
+    // the same thing). Parsed as its own self-contained operand form
+    // rather than falling through to the rest of this function.
+    if let Some(tok) = peek(tokens, *pos) {
+        if is_keyword(tok, "offset") {
+            *pos += 1;
+            let expr = parse_expr_chain(tokens, pos)?;
+            return Ok(ParsedOperand::Immediate(ParsedExpr::Offset(Box::new(expr))));
+        }
+    }
+
     let mut size_override = None;
     if let Some(tok) = peek(tokens, *pos) {
         if is_keyword(tok, "byte") || is_keyword(tok, "word") {
-            let ptr_pos = *pos + 1;
-            if peek(tokens, ptr_pos).is_some_and(|t| is_keyword(t, "ptr")) {
-                size_override = Some(if is_keyword(tok, "byte") {
-                    Width::Byte
-                } else {
-                    Width::Word
-                });
-                *pos = ptr_pos + 1;
+            let width = if is_keyword(tok, "byte") {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            // MASM/emu8086 spell this `BYTE PTR [...]`/`WORD PTR [...]`;
+            // NASM drops `PTR` entirely (`WORD [...]`) - accept both by
+            // treating `PTR` as optional, and only actually committing to
+            // a size override once a `[` confirms a memory operand
+            // really does follow (so a real symbol that just happens to
+            // be spelled "byte"/"word" - unlikely, but possible - isn't
+            // misread as a size prefix).
+            let mut after_pos = *pos + 1;
+            if peek(tokens, after_pos).is_some_and(|t| is_keyword(t, "ptr")) {
+                after_pos += 1;
+            }
+            if peek(tokens, after_pos).is_some_and(|t| is_punct(t, "[")) {
+                size_override = Some(width);
+                *pos = after_pos;
             }
         }
     }
@@ -132,15 +156,47 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
         return Ok(operand);
     }
 
-    if matches!(tok.kind, TokenKind::Number | TokenKind::Identifier) {
+    if matches!(tok.kind, TokenKind::Number | TokenKind::Identifier) || is_punct(&tok, "$") {
         let expr = parse_expr_chain(tokens, pos)?;
         return Ok(ParsedOperand::Immediate(expr));
+    }
+
+    // A single-quoted character literal (`'0'`, `'A'`) used as an
+    // immediate - the classic emu8086 "convert a digit to ASCII" idiom
+    // (`ADD AL, '0'`). Only single-character literals are accepted here;
+    // multi-character packed-word literals aren't a pattern real emu8086
+    // programs rely on, so it's better to reject them clearly than to
+    // guess at a packing convention nobody asked for.
+    if tok.kind == TokenKind::StringLiteral && tok.text.starts_with('\'') {
+        let inner = strip_quotes(&tok.text);
+        if inner.len() == 1 {
+            *pos += 1;
+            return Ok(ParsedOperand::Immediate(ParsedExpr::Number(
+                inner.as_bytes()[0] as i64,
+            )));
+        }
+        return Err(ParseError::new(
+            tok.span,
+            format!(
+                "character-literal operand '{}' must be exactly one character",
+                tok.text
+            ),
+        ));
     }
 
     Err(ParseError::new(
         tok.span,
         format!("unexpected token '{}' in operand", tok.text),
     ))
+}
+
+fn strip_quotes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 {
+        text[1..text.len() - 1].to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// One register/number/symbol term inside `[...]`. Only consumes a
@@ -315,6 +371,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_dollar_as_an_immediate_operand() {
+        assert_eq!(
+            operand_of("$"),
+            ParsedOperand::Immediate(ParsedExpr::Symbol("$".to_string()))
+        );
+    }
+
+    #[test]
+    fn offset_keyword_wraps_the_expression_in_an_offset_node() {
+        // OFFSET must stay distinguishable from a bare reference - they
+        // aren't always the same thing (see `ParsedExpr::Offset`'s docs:
+        // MASM/emu8086 dereferences a bare `DB`/`DW` reference, but
+        // `OFFSET` always means "the address," in every dialect).
+        assert_eq!(
+            operand_of("OFFSET myLabel"),
+            ParsedOperand::Immediate(ParsedExpr::Offset(Box::new(ParsedExpr::Symbol(
+                "myLabel".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parses_a_single_character_literal_as_its_ascii_code() {
+        assert_eq!(
+            operand_of("'0'"),
+            ParsedOperand::Immediate(ParsedExpr::Number(b'0' as i64))
+        );
+        assert_eq!(
+            operand_of("'A'"),
+            ParsedOperand::Immediate(ParsedExpr::Number(b'A' as i64))
+        );
+    }
+
+    #[test]
+    fn rejects_a_multi_character_literal_operand() {
+        let tokens = tokenize("'AB'");
+        let mut pos = 0;
+        assert!(parse_operand(&tokens, &mut pos).is_err());
+    }
+
+    #[test]
     fn parses_simple_memory_operand() {
         assert_eq!(
             operand_of("[BX]"),
@@ -385,6 +482,33 @@ mod tests {
                 index: None,
                 displacement: None
             }
+        );
+    }
+
+    #[test]
+    fn parses_nasm_style_word_size_override_without_ptr() {
+        // NASM drops "PTR": `WORD [BX]` instead of `WORD PTR [BX]`.
+        assert_eq!(operand_of("WORD [BX]"), operand_of("WORD PTR [BX]"));
+        let op = operand_of("word [bp-2]");
+        assert_eq!(
+            op,
+            ParsedOperand::Memory {
+                size_override: Some(Width::Word),
+                segment_override: None,
+                base: Some(Reg16::Bp),
+                index: None,
+                displacement: Some(ParsedExpr::Number(-2)),
+            }
+        );
+    }
+
+    #[test]
+    fn a_symbol_named_word_without_a_following_bracket_is_not_a_size_override() {
+        // "word" alone (no "[" after it) must still parse as a plain
+        // symbol reference, not silently swallowed as a size prefix.
+        assert_eq!(
+            operand_of("word"),
+            ParsedOperand::Immediate(ParsedExpr::Symbol("word".to_string()))
         );
     }
 

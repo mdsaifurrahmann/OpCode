@@ -73,9 +73,12 @@ fn explicit_size_override_resolves_the_ambiguity() {
 }
 
 #[test]
-fn out_of_range_conditional_jump_is_a_diagnostic() {
+fn out_of_range_conditional_jump_auto_expands_into_an_invert_and_jmp_stub() {
     // Pad the distance between JE and its target past the 8-bit relative
-    // range (-128..=127) that Jcc is hard-limited to on the 8086.
+    // range (-128..=127) that Jcc is hard-limited to on the 8086. Real
+    // assemblers (MASM/TASM/NASM/emu8086) don't error here - they
+    // transparently expand this into "JNE +3 / JMP far_label", which is
+    // exactly what this test checks for.
     let mut source = String::from("JE far_label\n");
     for _ in 0..200 {
         source.push_str("NOP\n");
@@ -83,18 +86,57 @@ fn out_of_range_conditional_jump_is_a_diagnostic() {
     source.push_str("far_label: HLT\n");
 
     let result = assemble(&source);
-    assert_eq!(
-        result.diagnostics.len(),
-        1,
+    assert!(
+        result.diagnostics.is_empty(),
         "diagnostics: {:?}",
         result.diagnostics
     );
-    assert_eq!(result.diagnostics[0].line, 1);
+    // JNE +3 (skip the JMP) = 75 03; JMP near far_label = E9 <rel16>.
+    assert_eq!(&result.machine_code[0..2], &[0x75, 0x03]);
+    assert_eq!(result.machine_code[2], 0xE9);
+}
+
+#[test]
+fn forward_referenced_short_jcc_past_the_128_byte_mark_still_gets_correct_length() {
+    // Regression test: pass 1's own length computation for a *forward*
+    // Jcc reference used to evaluate the target leniently against a `0`
+    // placeholder, and once that Jcc sat more than ~128 bytes into the
+    // file, `0 - address_after` fell outside the 8-bit relative range
+    // even though the real, final target (just a few bytes ahead) is
+    // perfectly in range. `encode_one` failing on that placeholder made
+    // pass 1 silently contribute *zero* bytes for the statement,
+    // corrupting every address after it.
+    let mut source = String::new();
+    for _ in 0..150 {
+        source.push_str("NOP\n");
+    }
+    source.push_str("JE near_target\nMOV AX, 1\nnear_target: HLT\n");
+
+    let result = assemble(&source);
     assert!(
-        result.diagnostics[0].message.contains("range"),
-        "message: {}",
-        result.diagnostics[0].message
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result.diagnostics
     );
+
+    let je_addr = 150usize; // 150 one-byte NOPs precede the JE
+    let (je_instr, je_len) = x8086_decoder::decode_one(&result.machine_code[je_addr..]).unwrap();
+    assert_eq!(
+        je_instr.mnemonic,
+        x8086_isa::Mnemonic::Jcc(x8086_isa::Condition::Equal)
+    );
+    assert_eq!(
+        je_len, 2,
+        "a genuinely in-range Jcc must stay in the compact 2-byte form"
+    );
+
+    let mov_addr = je_addr + je_len;
+    let (mov_instr, mov_len) = x8086_decoder::decode_one(&result.machine_code[mov_addr..]).unwrap();
+    assert_eq!(mov_instr.mnemonic, x8086_isa::Mnemonic::Mov);
+
+    let hlt_addr = mov_addr + mov_len;
+    let (hlt_instr, _) = x8086_decoder::decode_one(&result.machine_code[hlt_addr..]).unwrap();
+    assert_eq!(hlt_instr.mnemonic, x8086_isa::Mnemonic::Hlt);
 }
 
 #[test]

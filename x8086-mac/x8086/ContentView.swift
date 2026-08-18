@@ -36,7 +36,7 @@ struct ContentView: View {
                 outputPane
                 MemoryView(controller: controller)
                     .frame(minWidth: 260)
-                StackView(entries: controller.stack, stackPointer: controller.registers.sp)
+                StackView(entries: controller.stack, spPhysicalAddress: controller.stackPointerPhysicalAddress)
                     .frame(minWidth: 160)
             }
             .frame(height: 220)

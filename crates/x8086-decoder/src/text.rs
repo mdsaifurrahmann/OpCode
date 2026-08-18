@@ -7,7 +7,7 @@
 //! hex displacements, canonical condition mnemonics rather than
 //! whichever alias the source used) are free to prioritize readability.
 
-use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Width};
+use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Repeat, Width};
 
 /// Formats `instr` as assembly text. `address` is the instruction's own
 /// address (not the address after it) - needed because a relative
@@ -17,6 +17,12 @@ use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Width};
 /// instruction itself sits in memory.
 pub fn format_instruction(instr: &Instruction, address: u32) -> String {
     let mnemonic = mnemonic_text(instr.mnemonic);
+    let repeat_prefix = match instr.repeat {
+        Some(Repeat::Rep) => "REP ",
+        Some(Repeat::Repe) => "REPE ",
+        Some(Repeat::Repne) => "REPNE ",
+        None => "",
+    };
 
     if is_relative_branch(instr.mnemonic) {
         if let [Operand::Immediate(displacement)] = instr.operands.as_slice() {
@@ -29,7 +35,7 @@ pub fn format_instruction(instr: &Instruction, address: u32) -> String {
     }
 
     if instr.operands.is_empty() {
-        return mnemonic.to_string();
+        return format!("{repeat_prefix}{mnemonic}");
     }
 
     let size_prefix = size_prefix_if_needed(instr);
@@ -38,7 +44,7 @@ pub fn format_instruction(instr: &Instruction, address: u32) -> String {
         .iter()
         .map(|operand| format_operand(operand, size_prefix))
         .collect();
-    format!("{mnemonic} {}", operand_text.join(", "))
+    format!("{repeat_prefix}{mnemonic} {}", operand_text.join(", "))
 }
 
 fn is_relative_branch(mnemonic: Mnemonic) -> bool {
@@ -223,6 +229,29 @@ fn mnemonic_text(mnemonic: Mnemonic) -> &'static str {
         Mnemonic::Std => "STD",
         Mnemonic::Cli => "CLI",
         Mnemonic::Sti => "STI",
+        Mnemonic::Shl => "SHL",
+        Mnemonic::Shr => "SHR",
+        Mnemonic::Sar => "SAR",
+        Mnemonic::Rol => "ROL",
+        Mnemonic::Ror => "ROR",
+        Mnemonic::Rcl => "RCL",
+        Mnemonic::Rcr => "RCR",
+        Mnemonic::Mul => "MUL",
+        Mnemonic::Imul => "IMUL",
+        Mnemonic::Div => "DIV",
+        Mnemonic::Idiv => "IDIV",
+        Mnemonic::Neg => "NEG",
+        Mnemonic::Not => "NOT",
+        Mnemonic::Movsb => "MOVSB",
+        Mnemonic::Movsw => "MOVSW",
+        Mnemonic::Cmpsb => "CMPSB",
+        Mnemonic::Cmpsw => "CMPSW",
+        Mnemonic::Stosb => "STOSB",
+        Mnemonic::Stosw => "STOSW",
+        Mnemonic::Lodsb => "LODSB",
+        Mnemonic::Lodsw => "LODSW",
+        Mnemonic::Scasb => "SCASB",
+        Mnemonic::Scasw => "SCASW",
         Mnemonic::Unknown => "???",
     }
 }

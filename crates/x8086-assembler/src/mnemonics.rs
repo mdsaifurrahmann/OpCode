@@ -63,17 +63,57 @@ pub fn lookup_mnemonic(text: &str) -> Option<Mnemonic> {
         "CLI" => Mnemonic::Cli,
         "STI" => Mnemonic::Sti,
 
+        "SHL" | "SAL" => Mnemonic::Shl,
+        "SHR" => Mnemonic::Shr,
+        "SAR" => Mnemonic::Sar,
+        "ROL" => Mnemonic::Rol,
+        "ROR" => Mnemonic::Ror,
+        "RCL" => Mnemonic::Rcl,
+        "RCR" => Mnemonic::Rcr,
+
+        "MUL" => Mnemonic::Mul,
+        "IMUL" => Mnemonic::Imul,
+        "DIV" => Mnemonic::Div,
+        "IDIV" => Mnemonic::Idiv,
+        "NEG" => Mnemonic::Neg,
+        "NOT" => Mnemonic::Not,
+
+        "MOVSB" => Mnemonic::Movsb,
+        "MOVSW" => Mnemonic::Movsw,
+        "CMPSB" => Mnemonic::Cmpsb,
+        "CMPSW" => Mnemonic::Cmpsw,
+        "STOSB" => Mnemonic::Stosb,
+        "STOSW" => Mnemonic::Stosw,
+        "LODSB" => Mnemonic::Lodsb,
+        "LODSW" => Mnemonic::Lodsw,
+        "SCASB" => Mnemonic::Scasb,
+        "SCASW" => Mnemonic::Scasw,
+
         _ => return None,
     })
 }
 
+/// The string-instruction-repeat prefixes: `REP` (unconditional on MOVS/
+/// STOS/LODS), `REPE`/`REPZ` and `REPNE`/`REPNZ` (conditional on ZF for
+/// CMPS/SCAS). Returns the `x8086_isa::Repeat` the prefix keyword maps to.
+pub fn lookup_repeat_prefix(text: &str) -> Option<x8086_isa::Repeat> {
+    match text.to_ascii_uppercase().as_str() {
+        "REP" => Some(x8086_isa::Repeat::Rep),
+        "REPE" | "REPZ" => Some(x8086_isa::Repeat::Repe),
+        "REPNE" | "REPNZ" => Some(x8086_isa::Repeat::Repne),
+        _ => None,
+    }
+}
+
 /// Structural/no-op directive keywords recognized only for source
 /// compatibility with real emu8086/MASM-style programs (see
-/// `StatementKind::NoOp`'s docs).
+/// `StatementKind::NoOp`'s docs). `.STACK`/`.DATA`/`.CODE` are handled
+/// separately in `statement_parser` since they get real effect now, not
+/// listed here.
 pub fn is_noop_directive_keyword(text: &str) -> bool {
     matches!(
         text.to_ascii_uppercase().as_str(),
-        ".MODEL" | ".STACK" | ".DATA" | ".CODE" | "SEGMENT" | "ENDS" | "ASSUME" | "ENDP"
+        ".MODEL" | "SEGMENT" | "ENDS" | "ASSUME" | "ENDP"
     )
 }
 
@@ -99,5 +139,65 @@ mod tests {
     #[test]
     fn unknown_text_is_none() {
         assert_eq!(lookup_mnemonic("FROBNICATE"), None);
+    }
+
+    #[test]
+    fn sal_is_an_alias_for_shl() {
+        assert_eq!(lookup_mnemonic("SAL"), Some(Mnemonic::Shl));
+        assert_eq!(lookup_mnemonic("SHL"), Some(Mnemonic::Shl));
+    }
+
+    #[test]
+    fn resolves_shift_rotate_and_unary_group_mnemonics() {
+        for (text, expected) in [
+            ("SHR", Mnemonic::Shr),
+            ("SAR", Mnemonic::Sar),
+            ("ROL", Mnemonic::Rol),
+            ("ROR", Mnemonic::Ror),
+            ("RCL", Mnemonic::Rcl),
+            ("RCR", Mnemonic::Rcr),
+            ("MUL", Mnemonic::Mul),
+            ("IMUL", Mnemonic::Imul),
+            ("DIV", Mnemonic::Div),
+            ("IDIV", Mnemonic::Idiv),
+            ("NEG", Mnemonic::Neg),
+            ("NOT", Mnemonic::Not),
+        ] {
+            assert_eq!(lookup_mnemonic(text), Some(expected), "for {text}");
+        }
+    }
+
+    #[test]
+    fn resolves_string_instruction_mnemonics() {
+        for (text, expected) in [
+            ("MOVSB", Mnemonic::Movsb),
+            ("MOVSW", Mnemonic::Movsw),
+            ("CMPSB", Mnemonic::Cmpsb),
+            ("CMPSW", Mnemonic::Cmpsw),
+            ("STOSB", Mnemonic::Stosb),
+            ("STOSW", Mnemonic::Stosw),
+            ("LODSB", Mnemonic::Lodsb),
+            ("LODSW", Mnemonic::Lodsw),
+            ("SCASB", Mnemonic::Scasb),
+            ("SCASW", Mnemonic::Scasw),
+        ] {
+            assert_eq!(lookup_mnemonic(text), Some(expected), "for {text}");
+        }
+    }
+
+    #[test]
+    fn resolves_repeat_prefix_keywords() {
+        assert_eq!(lookup_repeat_prefix("REP"), Some(x8086_isa::Repeat::Rep));
+        assert_eq!(lookup_repeat_prefix("repe"), Some(x8086_isa::Repeat::Repe));
+        assert_eq!(lookup_repeat_prefix("REPZ"), Some(x8086_isa::Repeat::Repe));
+        assert_eq!(
+            lookup_repeat_prefix("REPNE"),
+            Some(x8086_isa::Repeat::Repne)
+        );
+        assert_eq!(
+            lookup_repeat_prefix("REPNZ"),
+            Some(x8086_isa::Repeat::Repne)
+        );
+        assert_eq!(lookup_repeat_prefix("MOV"), None);
     }
 }

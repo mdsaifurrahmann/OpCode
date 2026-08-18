@@ -235,6 +235,17 @@ pub struct AssembleResult {
     pub line_to_address: BTreeMap<u32, u32>,
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: Vec<SymbolTableEntry>,
+    /// The data segment's paragraph-aligned base address, if `.DATA` was
+    /// used anywhere in the source. `None` means the program never
+    /// declared one, in which case a caller (see `x8086-emulator`'s
+    /// loader) must leave DS untouched rather than pointing it somewhere
+    /// meaningless.
+    pub data_segment_base: Option<u32>,
+    /// The stack segment's paragraph-aligned base address and requested
+    /// size in bytes, if `.STACK <size>` was used. `None` means no
+    /// stack was declared, in which case a caller must leave SS/SP
+    /// untouched.
+    pub stack_segment: Option<(u32, u32)>,
 }
 
 /// Two-pass assemble of emu8086-syntax source: lex -> parse -> resolve

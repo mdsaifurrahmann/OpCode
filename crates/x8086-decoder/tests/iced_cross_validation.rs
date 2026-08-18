@@ -80,6 +80,29 @@ fn matches_iced_mnemonic(ours: &Ours, iced: Iced) -> bool {
         Ours::Std => iced == Iced::Std,
         Ours::Cli => iced == Iced::Cli,
         Ours::Sti => iced == Iced::Sti,
+        Ours::Shl => matches!(iced, Iced::Shl),
+        Ours::Shr => iced == Iced::Shr,
+        Ours::Sar => iced == Iced::Sar,
+        Ours::Rol => iced == Iced::Rol,
+        Ours::Ror => iced == Iced::Ror,
+        Ours::Rcl => iced == Iced::Rcl,
+        Ours::Rcr => iced == Iced::Rcr,
+        Ours::Mul => iced == Iced::Mul,
+        Ours::Imul => iced == Iced::Imul,
+        Ours::Div => iced == Iced::Div,
+        Ours::Idiv => iced == Iced::Idiv,
+        Ours::Neg => iced == Iced::Neg,
+        Ours::Not => iced == Iced::Not,
+        Ours::Movsb => iced == Iced::Movsb,
+        Ours::Movsw => iced == Iced::Movsw,
+        Ours::Cmpsb => iced == Iced::Cmpsb,
+        Ours::Cmpsw => iced == Iced::Cmpsw,
+        Ours::Stosb => iced == Iced::Stosb,
+        Ours::Stosw => iced == Iced::Stosw,
+        Ours::Lodsb => iced == Iced::Lodsb,
+        Ours::Lodsw => iced == Iced::Lodsw,
+        Ours::Scasb => iced == Iced::Scasb,
+        Ours::Scasw => iced == Iced::Scasw,
         Ours::Unknown => false,
     }
 }
@@ -164,6 +187,32 @@ fn supported_fixtures() -> Vec<Vec<u8>> {
         vec![0xFB],                           // STI
         vec![0xFC],                           // CLD
         vec![0xFD],                           // STD
+        vec![0xD0, 0b11_100_000],             // SHL r/m8, 1
+        vec![0xD1, 0b11_101_001],             // SHR r/m16, 1
+        vec![0xD2, 0b11_111_000],             // SAR r/m8, CL
+        vec![0xD3, 0b11_000_001],             // ROL r/m16, CL
+        vec![0xC0, 0b11_010_000, 0x03],       // RCL r/m8, imm8 (80186)
+        vec![0xC1, 0b11_011_001, 0x02],       // RCR r/m16, imm8 (80186)
+        vec![0xF6, 0b11_010_000],             // NOT r/m8
+        vec![0xF6, 0b11_011_001],             // NEG r/m8
+        vec![0xF7, 0b11_100_000],             // MUL r/m16
+        vec![0xF7, 0b11_101_001],             // IMUL r/m16
+        vec![0xF6, 0b11_110_010],             // DIV r/m8
+        vec![0xF7, 0b11_111_011],             // IDIV r/m16
+        vec![0xF6, 0b00_000_111, 0x0F],       // TEST r/m8, imm8 (group F6)
+        vec![0xA4],                           // MOVSB
+        vec![0xA5],                           // MOVSW
+        vec![0xA6],                           // CMPSB
+        vec![0xA7],                           // CMPSW
+        vec![0xAA],                           // STOSB
+        vec![0xAB],                           // STOSW
+        vec![0xAC],                           // LODSB
+        vec![0xAD],                           // LODSW
+        vec![0xAE],                           // SCASB
+        vec![0xAF],                           // SCASW
+        vec![0xF3, 0xA4],                     // REP MOVSB
+        vec![0xF3, 0xA6],                     // REPE CMPSB
+        vec![0xF2, 0xAE],                     // REPNE SCASB
     ]
 }
 

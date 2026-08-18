@@ -3,12 +3,13 @@
 //! this emits a `Statement::Label` followed by whatever else the line
 //! contains, all sharing that line's number.
 
-use crate::ast::{DataItem, ParsedOperand, Statement, StatementKind};
+use crate::ast::{DataItem, ParsedOperand, SegmentRole, Statement, StatementKind};
 use crate::expr_parser::parse_expr_chain;
-use crate::mnemonics::{is_noop_directive_keyword, lookup_mnemonic};
+use crate::mnemonics::{is_noop_directive_keyword, lookup_mnemonic, lookup_repeat_prefix};
 use crate::operand_parser::parse_operand;
 use crate::parse_error::ParseError;
 use crate::{tokenize, Token, TokenKind};
+use x8086_isa::Mnemonic;
 
 /// Tokenizes and parses a whole program. Parse errors are collected
 /// (not fatal): a bad line is skipped, recovering at the next line, so
@@ -115,7 +116,109 @@ fn parse_line(tokens: &[Token]) -> Result<Vec<Statement>, ParseError> {
             return Ok(statements);
         }
 
+        if is_keyword(&first, ".stack") {
+            pos += 1;
+            let size = parse_expr_chain(tokens, &mut pos)?;
+            ensure_line_consumed(tokens, pos)?;
+            statements.push(Statement {
+                kind: StatementKind::Stack(size),
+                line,
+            });
+            return Ok(statements);
+        }
+
+        if is_keyword(&first, ".data") || is_keyword(&first, ".code") {
+            let role = if is_keyword(&first, ".data") {
+                SegmentRole::Data
+            } else {
+                SegmentRole::Code
+            };
+            pos += 1;
+            ensure_line_consumed(tokens, pos)?;
+            statements.push(Statement {
+                kind: StatementKind::SegmentSwitch(role),
+                line,
+            });
+            return Ok(statements);
+        }
+
+        // NASM `SECTION .text`/`SECTION .data` (also accepts the bare
+        // `.bss`/`text`/`data`/`code` spellings some NASM programs use) -
+        // maps onto the same `SegmentSwitch` mechanism as `.CODE`/`.DATA`.
+        if is_keyword(&first, "section") {
+            pos += 1;
+            let name_tok = tokens.get(pos).ok_or_else(|| {
+                ParseError::new(first.span, "expected a section name after SECTION")
+            })?;
+            let role = if [".data", "data", ".bss", "bss"]
+                .iter()
+                .any(|kw| is_keyword(name_tok, kw))
+            {
+                SegmentRole::Data
+            } else if [".text", "text", ".code", "code"]
+                .iter()
+                .any(|kw| is_keyword(name_tok, kw))
+            {
+                SegmentRole::Code
+            } else {
+                return Err(ParseError::new(
+                    name_tok.span,
+                    format!("unrecognized SECTION name '{}'", name_tok.text),
+                ));
+            };
+            pos += 1;
+            ensure_line_consumed(tokens, pos)?;
+            statements.push(Statement {
+                kind: StatementKind::SegmentSwitch(role),
+                line,
+            });
+            return Ok(statements);
+        }
+
+        // `REP`/`REPE`/`REPZ`/`REPNE`/`REPNZ` string-instruction prefix.
+        if let Some(repeat) = lookup_repeat_prefix(&first.text) {
+            pos += 1;
+            let mnemonic_tok = tokens.get(pos).ok_or_else(|| {
+                ParseError::new(
+                    first.span,
+                    format!("expected a string instruction after '{}'", first.text),
+                )
+            })?;
+            let mnemonic = lookup_mnemonic(&mnemonic_tok.text).ok_or_else(|| {
+                ParseError::new(
+                    mnemonic_tok.span,
+                    format!(
+                        "unrecognized statement starting with '{}'",
+                        mnemonic_tok.text
+                    ),
+                )
+            })?;
+            if !is_repeatable_mnemonic(mnemonic) {
+                return Err(ParseError::new(
+                    mnemonic_tok.span,
+                    format!(
+                        "'{}' cannot be prefixed with {} - only string instructions can",
+                        mnemonic_tok.text, first.text
+                    ),
+                ));
+            }
+            pos += 1;
+            let operands = parse_operand_list(tokens, &mut pos)?;
+            ensure_line_consumed(tokens, pos)?;
+            statements.push(Statement {
+                kind: StatementKind::Instruction {
+                    mnemonic,
+                    operands,
+                    short_jump: false,
+                    repeat: Some(repeat),
+                },
+                line,
+            });
+            return Ok(statements);
+        }
+
         // `NAME EQU expr` / `NAME DB ...` / `NAME DW ...` / `NAME PROC ...`
+        // / `NAME ENDP` / `NAME TIMES count DB/DW item`
         if let Some(second) = tokens.get(pos + 1) {
             if second.kind == TokenKind::Identifier {
                 if is_keyword(second, "equ") {
@@ -156,6 +259,24 @@ fn parse_line(tokens: &[Token]) -> Result<Vec<Statement>, ParseError> {
                     });
                     return Ok(statements);
                 }
+                if is_keyword(second, "endp") {
+                    // `NAME ENDP` closes a PROC - a pure structural
+                    // marker. Unlike PROC, it defines no symbol, so
+                    // (unlike bare `ENDP`, which is dispatched below via
+                    // `is_noop_directive_keyword`) there's nothing to do
+                    // beyond recognizing and discarding the line.
+                    return Ok(statements);
+                }
+                if is_keyword(second, "times") {
+                    let name = first.text.clone();
+                    statements.push(Statement {
+                        kind: StatementKind::Label(name),
+                        line,
+                    });
+                    pos += 2;
+                    statements.push(parse_times(tokens, &mut pos, line)?);
+                    return Ok(statements);
+                }
             }
         }
     }
@@ -172,6 +293,14 @@ fn parse_line(tokens: &[Token]) -> Result<Vec<Statement>, ParseError> {
             StatementKind::Dw(items)
         };
         statements.push(Statement { kind, line });
+        return Ok(statements);
+    }
+
+    // Bare `TIMES count DB/DW item` (no leading name), NASM's repeat
+    // directive - most commonly used for unnamed padding.
+    if is_keyword(&first, "times") {
+        pos += 1;
+        statements.push(parse_times(tokens, &mut pos, line)?);
         return Ok(statements);
     }
 
@@ -193,6 +322,7 @@ fn parse_line(tokens: &[Token]) -> Result<Vec<Statement>, ParseError> {
                     mnemonic,
                     operands,
                     short_jump,
+                    repeat: None,
                 },
                 line,
             });
@@ -204,6 +334,56 @@ fn parse_line(tokens: &[Token]) -> Result<Vec<Statement>, ParseError> {
         first.span,
         format!("unrecognized statement starting with '{}'", first.text),
     ))
+}
+
+fn is_repeatable_mnemonic(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Movsb
+            | Mnemonic::Movsw
+            | Mnemonic::Cmpsb
+            | Mnemonic::Cmpsw
+            | Mnemonic::Stosb
+            | Mnemonic::Stosw
+            | Mnemonic::Lodsb
+            | Mnemonic::Lodsw
+            | Mnemonic::Scasb
+            | Mnemonic::Scasw
+    )
+}
+
+/// `TIMES count DB/DW item` (the `TIMES` keyword itself already consumed
+/// by the caller, which also owns emitting any leading label) - NASM
+/// sugar for repeating one data item, equivalent to `count DUP(item)`.
+fn parse_times(tokens: &[Token], pos: &mut usize, line: u32) -> Result<Statement, ParseError> {
+    let count = parse_expr_chain(tokens, pos)?;
+    let size_tok = tokens.get(*pos).ok_or_else(|| {
+        ParseError::new(Default::default(), "expected DB or DW after TIMES count")
+    })?;
+    let is_byte = is_keyword(size_tok, "db");
+    let is_word = is_keyword(size_tok, "dw");
+    if !is_byte && !is_word {
+        return Err(ParseError::new(
+            size_tok.span,
+            format!(
+                "expected DB or DW after TIMES count, found '{}'",
+                size_tok.text
+            ),
+        ));
+    }
+    *pos += 1;
+    let item = parse_data_item(tokens, pos)?;
+    ensure_line_consumed(tokens, *pos)?;
+    let dup = DataItem::Dup {
+        count,
+        item: Box::new(item),
+    };
+    let kind = if is_byte {
+        StatementKind::Db(vec![dup])
+    } else {
+        StatementKind::Dw(vec![dup])
+    };
+    Ok(Statement { kind, line })
 }
 
 fn parse_operand_list(tokens: &[Token], pos: &mut usize) -> Result<Vec<ParsedOperand>, ParseError> {
@@ -332,7 +512,8 @@ mod tests {
             StatementKind::Instruction {
                 mnemonic: Mnemonic::Hlt,
                 operands: vec![],
-                short_jump: false
+                short_jump: false,
+                repeat: None,
             }
         );
     }
@@ -351,6 +532,7 @@ mod tests {
                     ParsedOperand::Immediate(crate::ast::ParsedExpr::Number(5))
                 ],
                 short_jump: false,
+                repeat: None,
             }
         );
     }
@@ -449,7 +631,7 @@ mod tests {
     #[test]
     fn noop_directives_produce_no_statements_but_no_error() {
         let (stmts, errors) =
-            parse_program(".MODEL SMALL\n.STACK 100h\n.DATA\n.CODE\nASSUME CS:CODE\nHLT");
+            parse_program(".MODEL SMALL\nSEGMENT CODE\nENDS\nASSUME CS:CODE\nENDP\nHLT");
         assert!(errors.is_empty());
         assert_eq!(stmts.len(), 1); // only the HLT
         assert_eq!(
@@ -457,7 +639,36 @@ mod tests {
             StatementKind::Instruction {
                 mnemonic: Mnemonic::Hlt,
                 operands: vec![],
-                short_jump: false
+                short_jump: false,
+                repeat: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stack_data_code_directives_produce_real_statements() {
+        let (stmts, errors) = parse_program(".STACK 100h\n.DATA\n.CODE\nHLT");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(stmts.len(), 4);
+        assert_eq!(
+            stmts[0].kind,
+            StatementKind::Stack(crate::ast::ParsedExpr::Number(0x100))
+        );
+        assert_eq!(
+            stmts[1].kind,
+            StatementKind::SegmentSwitch(SegmentRole::Data)
+        );
+        assert_eq!(
+            stmts[2].kind,
+            StatementKind::SegmentSwitch(SegmentRole::Code)
+        );
+        assert_eq!(
+            stmts[3].kind,
+            StatementKind::Instruction {
+                mnemonic: Mnemonic::Hlt,
+                operands: vec![],
+                short_jump: false,
+                repeat: None,
             }
         );
     }
@@ -481,7 +692,8 @@ mod tests {
             StatementKind::Instruction {
                 mnemonic: Mnemonic::Hlt,
                 operands: vec![],
-                short_jump: false
+                short_jump: false,
+                repeat: None,
             }
         );
     }
@@ -498,5 +710,102 @@ mod tests {
         assert_eq!(stmts[0].line, 1);
         assert_eq!(stmts[1].line, 2);
         assert_eq!(stmts[2].line, 3);
+    }
+
+    #[test]
+    fn name_endp_closes_a_proc_without_erroring() {
+        let (stmts, errors) = parse_program("MAIN PROC\nHLT\nMAIN ENDP\nEND MAIN");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        // MAIN (label), HLT, END - the ENDP line produces nothing.
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0].kind, StatementKind::Label("MAIN".to_string()));
+    }
+
+    #[test]
+    fn section_text_and_data_map_onto_segment_switch() {
+        let (stmts, errors) = parse_program("SECTION .text\nHLT\nSECTION .data\nHLT");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            stmts[0].kind,
+            StatementKind::SegmentSwitch(SegmentRole::Code)
+        );
+        assert_eq!(
+            stmts[2].kind,
+            StatementKind::SegmentSwitch(SegmentRole::Data)
+        );
+    }
+
+    #[test]
+    fn section_with_an_unknown_name_is_an_error() {
+        let (_, errors) = parse_program("SECTION .rodata");
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn named_times_directive_desugars_to_dup() {
+        let (stmts, errors) = parse_program("dst times 32 db 0");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].kind, StatementKind::Label("dst".to_string()));
+        assert_eq!(
+            stmts[1].kind,
+            StatementKind::Db(vec![DataItem::Dup {
+                count: crate::ast::ParsedExpr::Number(32),
+                item: Box::new(DataItem::Value(crate::ast::ParsedExpr::Number(0))),
+            }])
+        );
+    }
+
+    #[test]
+    fn bare_times_directive_without_a_label_works() {
+        let (stmts, errors) = parse_program("TIMES 4 DW 0");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(
+            stmts[0].kind,
+            StatementKind::Dw(vec![DataItem::Dup {
+                count: crate::ast::ParsedExpr::Number(4),
+                item: Box::new(DataItem::Value(crate::ast::ParsedExpr::Number(0))),
+            }])
+        );
+    }
+
+    #[test]
+    fn rep_prefix_attaches_to_a_string_instruction() {
+        let (stmts, errors) = parse_program("REP MOVSB");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            stmts[0].kind,
+            StatementKind::Instruction {
+                mnemonic: Mnemonic::Movsb,
+                operands: vec![],
+                short_jump: false,
+                repeat: Some(x8086_isa::Repeat::Rep),
+            }
+        );
+    }
+
+    #[test]
+    fn repe_and_repne_prefixes_resolve_to_the_right_repeat_variant() {
+        let (stmts, errors) = parse_program("REPE CMPSB\nREPNE SCASB");
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        match &stmts[0].kind {
+            StatementKind::Instruction { repeat, .. } => {
+                assert_eq!(*repeat, Some(x8086_isa::Repeat::Repe))
+            }
+            other => panic!("expected an instruction, got {other:?}"),
+        }
+        match &stmts[1].kind {
+            StatementKind::Instruction { repeat, .. } => {
+                assert_eq!(*repeat, Some(x8086_isa::Repeat::Repne))
+            }
+            other => panic!("expected an instruction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rep_prefix_on_a_non_string_instruction_is_a_diagnostic() {
+        let (_, errors) = parse_program("REP MOV AX, BX");
+        assert_eq!(errors.len(), 1);
     }
 }

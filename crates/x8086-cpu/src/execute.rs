@@ -9,7 +9,7 @@
 
 use crate::operand::{effective_offset, read_operand, write_operand};
 use crate::{flags, Registers};
-use x8086_isa::{Condition, Flag, Instruction, Mnemonic, Operand, Width};
+use x8086_isa::{Condition, Flag, Instruction, Mnemonic, Operand, Reg8, Repeat, Width};
 use x8086_memory::Memory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,9 +227,442 @@ pub fn execute(instr: &Instruction, regs: &mut Registers, memory: &mut Memory) -
         Mnemonic::Cli => regs.set_flag(Flag::Interrupt, false),
         Mnemonic::Sti => regs.set_flag(Flag::Interrupt, true),
 
+        Mnemonic::Shl
+        | Mnemonic::Shr
+        | Mnemonic::Sar
+        | Mnemonic::Rol
+        | Mnemonic::Ror
+        | Mnemonic::Rcl
+        | Mnemonic::Rcr => {
+            let width = instr.width.expect("shift/rotate always carries a width");
+            let count = shift_rotate_count(instr, regs);
+            execute_shift_rotate(
+                instr.mnemonic,
+                &instr.operands[0],
+                width,
+                count,
+                regs,
+                memory,
+            );
+        }
+
+        Mnemonic::Mul => {
+            let width = instr.width.expect("MUL always carries a width");
+            execute_mul(&instr.operands[0], width, regs, memory);
+        }
+        Mnemonic::Imul => {
+            let width = instr.width.expect("IMUL always carries a width");
+            execute_imul(&instr.operands[0], width, regs, memory);
+        }
+        Mnemonic::Div => {
+            let width = instr.width.expect("DIV always carries a width");
+            if !execute_div(&instr.operands[0], width, regs, memory) {
+                return ExecutionEffect::Interrupt(0); // divide error / overflow
+            }
+        }
+        Mnemonic::Idiv => {
+            let width = instr.width.expect("IDIV always carries a width");
+            if !execute_idiv(&instr.operands[0], width, regs, memory) {
+                return ExecutionEffect::Interrupt(0); // divide error / overflow
+            }
+        }
+        Mnemonic::Neg => {
+            let width = instr.width.expect("NEG always carries a width");
+            let op = &instr.operands[0];
+            let a = read_operand(op, width, regs, memory);
+            let result = flags::sub_with_flags(regs, 0, a, false, width);
+            write_operand(op, width, result, regs, memory);
+        }
+        Mnemonic::Not => {
+            let width = instr.width.expect("NOT always carries a width");
+            let op = &instr.operands[0];
+            let mask: u16 = match width {
+                Width::Byte => 0x00FF,
+                Width::Word => 0xFFFF,
+            };
+            let a = read_operand(op, width, regs, memory);
+            write_operand(op, width, !a & mask, regs, memory);
+        }
+
+        Mnemonic::Movsb
+        | Mnemonic::Movsw
+        | Mnemonic::Cmpsb
+        | Mnemonic::Cmpsw
+        | Mnemonic::Stosb
+        | Mnemonic::Stosw
+        | Mnemonic::Lodsb
+        | Mnemonic::Lodsw
+        | Mnemonic::Scasb
+        | Mnemonic::Scasw => match instr.repeat {
+            None => execute_string_op(instr.mnemonic, regs, memory),
+            Some(repeat) => {
+                while regs.cx != 0 {
+                    execute_string_op(instr.mnemonic, regs, memory);
+                    regs.cx = regs.cx.wrapping_sub(1);
+                    let stop = match repeat {
+                        Repeat::Rep => false,
+                        Repeat::Repe => !regs.get_flag(Flag::Zero),
+                        Repeat::Repne => regs.get_flag(Flag::Zero),
+                    };
+                    if stop {
+                        break;
+                    }
+                }
+            }
+        },
+
         Mnemonic::Unknown => {}
     }
     ExecutionEffect::Continue
+}
+
+// --- shift/rotate group -------------------------------------------------
+
+fn shift_rotate_count(instr: &Instruction, regs: &Registers) -> u32 {
+    match instr.operands.get(1) {
+        Some(Operand::Immediate(n)) => *n as u32 & 0xFF,
+        Some(Operand::Reg8(Reg8::Cl)) => regs.get8(Reg8::Cl) as u32,
+        _ => 0,
+    }
+}
+
+/// Real 8086 semantics: a `CL`/immediate count is *not* masked to the
+/// operand width (that width-masking is a 286+ behavior) - a count of,
+/// say, 20 on a byte operand genuinely shifts/rotates 20 times, which a
+/// bit-at-a-time loop handles correctly (and with no risk of the `<<`/`>>`
+/// overflow panic a single wide shift by a large count would hit).
+fn execute_shift_rotate(
+    mnemonic: Mnemonic,
+    dst: &Operand,
+    width: Width,
+    count: u32,
+    regs: &mut Registers,
+    memory: &mut Memory,
+) {
+    if count == 0 {
+        // A count of 0 leaves both the value and every flag untouched -
+        // a well-known 8086 quirk (mirrors INC/DEC not touching CF).
+        return;
+    }
+    let bits = match width {
+        Width::Byte => 8u32,
+        Width::Word => 16u32,
+    };
+    let mask = (1u32 << bits) - 1;
+    let sign_bit = 1u32 << (bits - 1);
+    let original = read_operand(dst, width, regs, memory) as u32 & mask;
+    let mut value = original;
+    let mut carry = regs.get_flag(Flag::Carry) as u32;
+
+    for _ in 0..count {
+        carry = match mnemonic {
+            Mnemonic::Shl => {
+                let out = (value & sign_bit) != 0;
+                value = (value << 1) & mask;
+                out as u32
+            }
+            Mnemonic::Shr => {
+                let out = value & 1;
+                value >>= 1;
+                out
+            }
+            Mnemonic::Sar => {
+                let out = value & 1;
+                let sign = value & sign_bit;
+                value = (value >> 1) | sign;
+                out
+            }
+            Mnemonic::Rol => {
+                let out = (value & sign_bit) != 0;
+                value = ((value << 1) | out as u32) & mask;
+                out as u32
+            }
+            Mnemonic::Ror => {
+                let out = value & 1;
+                value = (value >> 1) | (out << (bits - 1));
+                out
+            }
+            Mnemonic::Rcl => {
+                let out = (value & sign_bit) != 0;
+                value = ((value << 1) | carry) & mask;
+                out as u32
+            }
+            Mnemonic::Rcr => {
+                let out = value & 1;
+                value = (value >> 1) | (carry << (bits - 1));
+                out
+            }
+            other => unreachable!(
+                "execute_shift_rotate only dispatches for the shift/rotate group, got {other:?}"
+            ),
+        };
+    }
+
+    regs.set_flag(Flag::Carry, carry != 0);
+    // OF is only architecturally defined when the count is exactly 1;
+    // for larger counts real hardware leaves it undefined, so we simply
+    // don't touch it (deterministic: it keeps whatever it already held).
+    if count == 1 {
+        let overflow = match mnemonic {
+            Mnemonic::Shl | Mnemonic::Rol | Mnemonic::Rcl => {
+                ((value & sign_bit) != 0) != (carry != 0)
+            }
+            Mnemonic::Shr => (original & sign_bit) != 0,
+            Mnemonic::Sar => false,
+            Mnemonic::Ror | Mnemonic::Rcr => {
+                let msb = (value & sign_bit) != 0;
+                let msb2 = (value & (sign_bit >> 1)) != 0;
+                msb != msb2
+            }
+            other => unreachable!(
+                "execute_shift_rotate only dispatches for the shift/rotate group, got {other:?}"
+            ),
+        };
+        regs.set_flag(Flag::Overflow, overflow);
+    }
+    // Shifts (not rotates) also update ZF/SF/PF from the result; AF is
+    // documented as undefined after any shift, so we leave it untouched
+    // rather than guessing at a value nothing can rely on.
+    if matches!(mnemonic, Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar) {
+        regs.set_flag(Flag::Zero, value == 0);
+        regs.set_flag(Flag::Sign, (value & sign_bit) != 0);
+        regs.set_flag(Flag::Parity, flags::parity_even(value as u8));
+    }
+
+    write_operand(dst, width, value as u16, regs, memory);
+}
+
+// --- MUL/IMUL/DIV/IDIV ---------------------------------------------------
+
+fn execute_mul(src: &Operand, width: Width, regs: &mut Registers, memory: &mut Memory) {
+    match width {
+        Width::Byte => {
+            let al = regs.get8(Reg8::Al) as u32;
+            let operand = read_operand(src, width, regs, memory) as u32;
+            let result = al * operand;
+            regs.ax = result as u16;
+            let overflow = (result >> 8) != 0;
+            regs.set_flag(Flag::Carry, overflow);
+            regs.set_flag(Flag::Overflow, overflow);
+        }
+        Width::Word => {
+            let ax = regs.ax as u32;
+            let operand = read_operand(src, width, regs, memory) as u32;
+            let result = ax * operand;
+            regs.ax = result as u16;
+            regs.dx = (result >> 16) as u16;
+            let overflow = regs.dx != 0;
+            regs.set_flag(Flag::Carry, overflow);
+            regs.set_flag(Flag::Overflow, overflow);
+        }
+    }
+}
+
+fn execute_imul(src: &Operand, width: Width, regs: &mut Registers, memory: &mut Memory) {
+    match width {
+        Width::Byte => {
+            let al = regs.get8(Reg8::Al) as i8 as i32;
+            let operand = read_operand(src, width, regs, memory) as u8 as i8 as i32;
+            let result = al * operand;
+            regs.ax = result as u16;
+            let overflow = result != (result as i8 as i32);
+            regs.set_flag(Flag::Carry, overflow);
+            regs.set_flag(Flag::Overflow, overflow);
+        }
+        Width::Word => {
+            let ax = regs.ax as i16 as i32;
+            let operand = read_operand(src, width, regs, memory) as i16 as i32;
+            let result = ax * operand;
+            regs.ax = result as u16;
+            regs.dx = (result >> 16) as u16;
+            let overflow = result != (result as i16 as i32);
+            regs.set_flag(Flag::Carry, overflow);
+            regs.set_flag(Flag::Overflow, overflow);
+        }
+    }
+}
+
+/// Returns `false` on divide-by-zero or quotient overflow, in which case
+/// the caller reports it as `ExecutionEffect::Interrupt(0)` (vector 0 is
+/// the real 8086's divide-error interrupt) instead of writing any
+/// register - matching real hardware, which leaves AX/DX untouched when
+/// the division faults.
+fn execute_div(src: &Operand, width: Width, regs: &mut Registers, memory: &mut Memory) -> bool {
+    match width {
+        Width::Byte => {
+            let divisor = read_operand(src, width, regs, memory);
+            if divisor == 0 {
+                return false;
+            }
+            let dividend = regs.ax;
+            let quotient = dividend / divisor;
+            let remainder = dividend % divisor;
+            if quotient > 0xFF {
+                return false;
+            }
+            regs.set8(Reg8::Al, quotient as u8);
+            regs.set8(Reg8::Ah, remainder as u8);
+            true
+        }
+        Width::Word => {
+            let divisor = read_operand(src, width, regs, memory) as u32;
+            if divisor == 0 {
+                return false;
+            }
+            let dividend = ((regs.dx as u32) << 16) | (regs.ax as u32);
+            let quotient = dividend / divisor;
+            let remainder = dividend % divisor;
+            if quotient > 0xFFFF {
+                return false;
+            }
+            regs.ax = quotient as u16;
+            regs.dx = remainder as u16;
+            true
+        }
+    }
+}
+
+fn execute_idiv(src: &Operand, width: Width, regs: &mut Registers, memory: &mut Memory) -> bool {
+    match width {
+        Width::Byte => {
+            let divisor = read_operand(src, width, regs, memory) as u8 as i8 as i32;
+            if divisor == 0 {
+                return false;
+            }
+            let dividend = regs.ax as i16 as i32;
+            let quotient = dividend / divisor;
+            let remainder = dividend % divisor;
+            if !(i8::MIN as i32..=i8::MAX as i32).contains(&quotient) {
+                return false;
+            }
+            regs.set8(Reg8::Al, quotient as i8 as u8);
+            regs.set8(Reg8::Ah, remainder as i8 as u8);
+            true
+        }
+        Width::Word => {
+            let divisor = read_operand(src, width, regs, memory) as i16 as i32;
+            if divisor == 0 {
+                return false;
+            }
+            let dividend = (((regs.dx as u32) << 16) | (regs.ax as u32)) as i32;
+            let quotient = dividend / divisor;
+            let remainder = dividend % divisor;
+            if !(i16::MIN as i32..=i16::MAX as i32).contains(&quotient) {
+                return false;
+            }
+            regs.ax = quotient as i16 as u16;
+            regs.dx = remainder as i16 as u16;
+            true
+        }
+    }
+}
+
+// --- string instructions --------------------------------------------------
+
+/// The per-iteration step applied to SI/DI: `+width` normally, `-width`
+/// when the Direction flag is set (`STD`).
+fn string_step(width: Width, direction_flag: bool) -> u16 {
+    let n: u16 = match width {
+        Width::Byte => 1,
+        Width::Word => 2,
+    };
+    if direction_flag {
+        0u16.wrapping_sub(n)
+    } else {
+        n
+    }
+}
+
+/// One iteration of a string instruction. Source is always `DS:SI`
+/// (segment-override prefixes aren't decoded yet) and destination is
+/// always `ES:DI` (never overridable, matching real 8086).
+fn execute_string_op(mnemonic: Mnemonic, regs: &mut Registers, memory: &mut Memory) {
+    let df = regs.get_flag(Flag::Direction);
+    match mnemonic {
+        Mnemonic::Movsb | Mnemonic::Movsw => {
+            let width = if mnemonic == Mnemonic::Movsb {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            let src_addr = Memory::resolve(regs.ds, regs.si);
+            let dst_addr = Memory::resolve(regs.es, regs.di);
+            match width {
+                Width::Byte => memory.write_u8(dst_addr, memory.read_u8(src_addr)),
+                Width::Word => memory.write_u16(dst_addr, memory.read_u16(src_addr)),
+            }
+            let step = string_step(width, df);
+            regs.si = regs.si.wrapping_add(step);
+            regs.di = regs.di.wrapping_add(step);
+        }
+        Mnemonic::Lodsb | Mnemonic::Lodsw => {
+            let width = if mnemonic == Mnemonic::Lodsb {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            let src_addr = Memory::resolve(regs.ds, regs.si);
+            match width {
+                Width::Byte => regs.set8(Reg8::Al, memory.read_u8(src_addr)),
+                Width::Word => regs.ax = memory.read_u16(src_addr),
+            }
+            regs.si = regs.si.wrapping_add(string_step(width, df));
+        }
+        Mnemonic::Stosb | Mnemonic::Stosw => {
+            let width = if mnemonic == Mnemonic::Stosb {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            let dst_addr = Memory::resolve(regs.es, regs.di);
+            match width {
+                Width::Byte => memory.write_u8(dst_addr, regs.get8(Reg8::Al)),
+                Width::Word => memory.write_u16(dst_addr, regs.ax),
+            }
+            regs.di = regs.di.wrapping_add(string_step(width, df));
+        }
+        Mnemonic::Cmpsb | Mnemonic::Cmpsw => {
+            let width = if mnemonic == Mnemonic::Cmpsb {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            let src_addr = Memory::resolve(regs.ds, regs.si);
+            let dst_addr = Memory::resolve(regs.es, regs.di);
+            let (a, b) = match width {
+                Width::Byte => (
+                    memory.read_u8(src_addr) as u16,
+                    memory.read_u8(dst_addr) as u16,
+                ),
+                Width::Word => (memory.read_u16(src_addr), memory.read_u16(dst_addr)),
+            };
+            flags::sub_with_flags(regs, a, b, false, width);
+            let step = string_step(width, df);
+            regs.si = regs.si.wrapping_add(step);
+            regs.di = regs.di.wrapping_add(step);
+        }
+        Mnemonic::Scasb | Mnemonic::Scasw => {
+            let width = if mnemonic == Mnemonic::Scasb {
+                Width::Byte
+            } else {
+                Width::Word
+            };
+            let dst_addr = Memory::resolve(regs.es, regs.di);
+            let acc = match width {
+                Width::Byte => regs.get8(Reg8::Al) as u16,
+                Width::Word => regs.ax,
+            };
+            let mem_val = match width {
+                Width::Byte => memory.read_u8(dst_addr) as u16,
+                Width::Word => memory.read_u16(dst_addr),
+            };
+            flags::sub_with_flags(regs, acc, mem_val, false, width);
+            regs.di = regs.di.wrapping_add(string_step(width, df));
+        }
+        other => {
+            unreachable!("execute_string_op only dispatches for string mnemonics, got {other:?}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +948,520 @@ mod tests {
         );
         execute(&i, &mut regs, &mut memory);
         assert_eq!(regs.ax, 0x11FF);
+    }
+
+    // --- shift/rotate group -------------------------------------------
+
+    #[test]
+    fn shl_by_cl_shifts_and_produces_the_expected_value() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 1);
+        regs.set8(Reg8::Cl, 3);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Shl,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 8);
+    }
+
+    #[test]
+    fn shr_by_cl_shifts_right() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0x80);
+        regs.set8(Reg8::Cl, 3);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Shr,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0x10);
+    }
+
+    #[test]
+    fn sar_preserves_the_sign_bit() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0xF0);
+        regs.set8(Reg8::Cl, 2);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Sar,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0xFC);
+    }
+
+    #[test]
+    fn rol_by_one_rotates_msb_into_lsb_and_carry() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0x81);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Rol,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0x03);
+        assert!(regs.get_flag(Flag::Carry));
+    }
+
+    #[test]
+    fn ror_by_one_rotates_lsb_into_msb_and_carry() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0x03);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Ror,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0x81);
+        assert!(regs.get_flag(Flag::Carry));
+    }
+
+    #[test]
+    fn rcl_chains_a_shifted_out_bit_between_two_registers() {
+        // Mirrors the classic "32-bit shift via two 16-bit halves" idiom:
+        // SHL AX,1 then RCL DX,1 propagates AX's vacated top bit into DX.
+        let mut regs = Registers::new();
+        regs.ax = 0x8000;
+        regs.dx = 0x0001;
+        let mut memory = Memory::new();
+        execute(
+            &instr(
+                Mnemonic::Shl,
+                vec![Operand::Reg16(Reg16::Ax), Operand::Immediate(1)],
+                Some(Width::Word),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.ax, 0x0000);
+        assert!(regs.get_flag(Flag::Carry));
+        execute(
+            &instr(
+                Mnemonic::Rcl,
+                vec![Operand::Reg16(Reg16::Dx), Operand::Immediate(1)],
+                Some(Width::Word),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.dx, 0x0003);
+    }
+
+    #[test]
+    fn rcr_chains_a_shifted_out_bit_between_two_registers() {
+        let mut regs = Registers::new();
+        regs.dx = 0x0003;
+        regs.ax = 0x0000;
+        let mut memory = Memory::new();
+        execute(
+            &instr(
+                Mnemonic::Shr,
+                vec![Operand::Reg16(Reg16::Dx), Operand::Immediate(1)],
+                Some(Width::Word),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.dx, 0x0001);
+        assert!(regs.get_flag(Flag::Carry));
+        execute(
+            &instr(
+                Mnemonic::Rcr,
+                vec![Operand::Reg16(Reg16::Ax), Operand::Immediate(1)],
+                Some(Width::Word),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.ax, 0x8000);
+    }
+
+    #[test]
+    fn rol_by_a_count_larger_than_the_width_still_rotates_correctly() {
+        // ROL AL, 4 on 0xFF is a value-wise no-op (every bit is already 1).
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0xFF);
+        regs.set8(Reg8::Cl, 4);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Rol,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0xFF);
+    }
+
+    #[test]
+    fn rcl_by_one_pulls_in_the_incoming_carry_flag() {
+        let mut regs = Registers::new();
+        regs.set_flag(Flag::Carry, true);
+        regs.set8(Reg8::Al, 0x00);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Rcl,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0x01);
+    }
+
+    #[test]
+    fn shift_by_zero_leaves_the_value_and_flags_untouched() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0x55);
+        regs.set_flag(Flag::Carry, true);
+        regs.set8(Reg8::Cl, 0);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Shl,
+            vec![Operand::Reg8(Reg8::Al), Operand::Reg8(Reg8::Cl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0x55);
+        assert!(regs.get_flag(Flag::Carry));
+    }
+
+    #[test]
+    fn shl_sets_zero_and_sign_from_the_result() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 0x80);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Shl,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.get8(Reg8::Al), 0);
+        assert!(regs.get_flag(Flag::Zero));
+        assert!(!regs.get_flag(Flag::Sign));
+    }
+
+    // --- MUL/IMUL/DIV/IDIV/NEG/NOT --------------------------------------
+
+    #[test]
+    fn mul_byte_sets_carry_and_overflow_when_ah_is_nonzero() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 200);
+        regs.set8(Reg8::Bl, 3);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Mul,
+            vec![Operand::Reg8(Reg8::Bl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.ax, 600);
+        assert!(regs.get_flag(Flag::Carry));
+        assert!(regs.get_flag(Flag::Overflow));
+    }
+
+    #[test]
+    fn mul_byte_clears_carry_when_the_result_fits_in_al() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 10);
+        regs.set8(Reg8::Bl, 5);
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Mul,
+            vec![Operand::Reg8(Reg8::Bl)],
+            Some(Width::Byte),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.ax, 50);
+        assert!(!regs.get_flag(Flag::Carry));
+    }
+
+    #[test]
+    fn mul_word_splits_the_result_across_dx_and_ax() {
+        let mut regs = Registers::new();
+        regs.ax = 0x1234;
+        regs.bx = 0x5678;
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Mul,
+            vec![Operand::Reg16(Reg16::Bx)],
+            Some(Width::Word),
+        );
+        execute(&i, &mut regs, &mut memory);
+        let expected = 0x1234u32 * 0x5678u32;
+        assert_eq!(regs.ax, expected as u16);
+        assert_eq!(regs.dx, (expected >> 16) as u16);
+        assert!(regs.get_flag(Flag::Carry));
+    }
+
+    #[test]
+    fn imul_word_handles_negative_operands_correctly() {
+        let mut regs = Registers::new();
+        regs.ax = 0xFFFE; // -2
+        regs.bx = 3;
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Imul,
+            vec![Operand::Reg16(Reg16::Bx)],
+            Some(Width::Word),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.ax, 0xFFFA); // -6
+        assert_eq!(regs.dx, 0xFFFF); // sign-extended
+        assert!(!regs.get_flag(Flag::Carry), "result fits in AX alone");
+    }
+
+    #[test]
+    fn div_word_computes_quotient_and_remainder() {
+        let mut regs = Registers::new();
+        regs.ax = 37;
+        regs.dx = 0;
+        regs.bx = 5;
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Div,
+            vec![Operand::Reg16(Reg16::Bx)],
+            Some(Width::Word),
+        );
+        let effect = execute(&i, &mut regs, &mut memory);
+        assert_eq!(effect, ExecutionEffect::Continue);
+        assert_eq!(regs.ax, 7);
+        assert_eq!(regs.dx, 2);
+    }
+
+    #[test]
+    fn div_by_zero_reports_interrupt_zero_without_touching_registers() {
+        let mut regs = Registers::new();
+        regs.ax = 10;
+        regs.dx = 0;
+        regs.bx = 0;
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Div,
+            vec![Operand::Reg16(Reg16::Bx)],
+            Some(Width::Word),
+        );
+        let effect = execute(&i, &mut regs, &mut memory);
+        assert_eq!(effect, ExecutionEffect::Interrupt(0));
+        assert_eq!(regs.ax, 10, "a faulted DIV must not clobber AX");
+    }
+
+    #[test]
+    fn idiv_word_handles_a_negative_dividend() {
+        let mut regs = Registers::new();
+        regs.ax = (-7i16) as u16;
+        regs.dx = 0xFFFF; // sign-extend -7 into DX:AX
+        regs.bx = 2;
+        let mut memory = Memory::new();
+        let i = instr(
+            Mnemonic::Idiv,
+            vec![Operand::Reg16(Reg16::Bx)],
+            Some(Width::Word),
+        );
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.ax as i16, -3);
+        assert_eq!(regs.dx as i16, -1);
+    }
+
+    #[test]
+    fn neg_computes_twos_complement_and_sets_carry_unless_operand_was_zero() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 5);
+        let mut memory = Memory::new();
+        execute(
+            &instr(
+                Mnemonic::Neg,
+                vec![Operand::Reg8(Reg8::Al)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.get8(Reg8::Al), (-5i8) as u8);
+        assert!(regs.get_flag(Flag::Carry));
+
+        regs.set8(Reg8::Al, 0);
+        execute(
+            &instr(
+                Mnemonic::Neg,
+                vec![Operand::Reg8(Reg8::Al)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.get8(Reg8::Al), 0);
+        assert!(!regs.get_flag(Flag::Carry), "NEG 0 must not set carry");
+    }
+
+    #[test]
+    fn not_flips_every_bit_and_leaves_flags_untouched() {
+        let mut regs = Registers::new();
+        regs.set_flag(Flag::Zero, true);
+        regs.ax = 0x00FF;
+        let mut memory = Memory::new();
+        execute(
+            &instr(
+                Mnemonic::Not,
+                vec![Operand::Reg16(Reg16::Ax)],
+                Some(Width::Word),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.ax, 0xFF00);
+        assert!(regs.get_flag(Flag::Zero), "NOT must not touch flags");
+    }
+
+    // --- string instructions + REP --------------------------------------
+
+    #[test]
+    fn movsb_copies_a_byte_and_advances_si_di_forward() {
+        let mut regs = Registers::new();
+        regs.si = 0x0100;
+        regs.di = 0x0200;
+        let mut memory = Memory::new();
+        memory.write_u8(0x0100, 0xAB);
+        execute(
+            &instr(Mnemonic::Movsb, vec![], None),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(memory.read_u8(0x0200), 0xAB);
+        assert_eq!(regs.si, 0x0101);
+        assert_eq!(regs.di, 0x0201);
+    }
+
+    #[test]
+    fn movsb_advances_backward_when_direction_flag_is_set() {
+        let mut regs = Registers::new();
+        regs.si = 0x0100;
+        regs.di = 0x0200;
+        regs.set_flag(Flag::Direction, true);
+        let mut memory = Memory::new();
+        execute(
+            &instr(Mnemonic::Movsb, vec![], None),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.si, 0x00FF);
+        assert_eq!(regs.di, 0x01FF);
+    }
+
+    #[test]
+    fn rep_movsb_copies_cx_bytes_and_leaves_cx_at_zero() {
+        let mut regs = Registers::new();
+        regs.si = 0x0000;
+        regs.di = 0x0100;
+        regs.cx = 5;
+        let mut memory = Memory::new();
+        for (i, b) in [1u8, 2, 3, 4, 5].iter().enumerate() {
+            memory.write_u8(i as u32, *b);
+        }
+        let i = instr(Mnemonic::Movsb, vec![], None).with_repeat(x8086_isa::Repeat::Rep);
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.cx, 0);
+        for i in 0..5u32 {
+            assert_eq!(memory.read_u8(0x0100 + i), (i + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn rep_movsb_with_cx_zero_does_nothing() {
+        let mut regs = Registers::new();
+        regs.cx = 0;
+        regs.si = 0x0000;
+        regs.di = 0x0100;
+        let mut memory = Memory::new();
+        memory.write_u8(0, 0xFF);
+        let i = instr(Mnemonic::Movsb, vec![], None).with_repeat(x8086_isa::Repeat::Rep);
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(memory.read_u8(0x0100), 0, "CX=0 must copy nothing");
+    }
+
+    #[test]
+    fn repe_cmpsb_stops_early_on_a_mismatch() {
+        let mut regs = Registers::new();
+        regs.cx = 5;
+        regs.si = 0x0000;
+        regs.di = 0x0100;
+        let mut memory = Memory::new();
+        let a = [1u8, 2, 3, 9, 5];
+        let b = [1u8, 2, 3, 4, 5];
+        for i in 0..5u32 {
+            memory.write_u8(i, a[i as usize]);
+            memory.write_u8(0x0100 + i, b[i as usize]);
+        }
+        let i = instr(Mnemonic::Cmpsb, vec![], None).with_repeat(x8086_isa::Repeat::Repe);
+        execute(&i, &mut regs, &mut memory);
+        // 4 iterations run (indices 0-3, the last being the mismatch); cx = 1.
+        assert_eq!(regs.cx, 1);
+        assert!(!regs.get_flag(Flag::Zero));
+    }
+
+    #[test]
+    fn repe_cmpsb_over_identical_buffers_runs_to_completion() {
+        let mut regs = Registers::new();
+        regs.cx = 3;
+        regs.si = 0x0000;
+        regs.di = 0x0100;
+        let mut memory = Memory::new();
+        for i in 0..3u32 {
+            memory.write_u8(i, 7);
+            memory.write_u8(0x0100 + i, 7);
+        }
+        let i = instr(Mnemonic::Cmpsb, vec![], None).with_repeat(x8086_isa::Repeat::Repe);
+        execute(&i, &mut regs, &mut memory);
+        assert_eq!(regs.cx, 0);
+        assert!(regs.get_flag(Flag::Zero));
+    }
+
+    #[test]
+    fn lodsb_and_stosb_round_trip_through_al() {
+        let mut regs = Registers::new();
+        regs.si = 0x0000;
+        regs.di = 0x0100;
+        let mut memory = Memory::new();
+        memory.write_u8(0, 0x42);
+        execute(
+            &instr(Mnemonic::Lodsb, vec![], None),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.get8(Reg8::Al), 0x42);
+        assert_eq!(regs.si, 1);
+        execute(
+            &instr(Mnemonic::Stosb, vec![], None),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(memory.read_u8(0x0100), 0x42);
+        assert_eq!(regs.di, 0x0101);
+    }
+
+    #[test]
+    fn scasb_compares_al_against_es_di_and_sets_zero_on_match() {
+        let mut regs = Registers::new();
+        regs.set8(Reg8::Al, 9);
+        regs.di = 0x0100;
+        let mut memory = Memory::new();
+        memory.write_u8(0x0100, 9);
+        execute(
+            &instr(Mnemonic::Scasb, vec![], None),
+            &mut regs,
+            &mut memory,
+        );
+        assert!(regs.get_flag(Flag::Zero));
+        assert_eq!(regs.di, 0x0101);
     }
 }

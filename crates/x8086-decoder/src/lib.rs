@@ -4,10 +4,13 @@
 //! producing the shared instruction model. Coverage so far: MOV/PUSH/POP/
 //! XCHG/LEA, the ADD/OR/ADC/SBB/AND/SUB/XOR/CMP group (register and
 //! immediate forms) plus TEST, INC/DEC, unconditional/conditional/short
-//! jumps, the LOOP family, near CALL/RET, INT/INT3/IRET, and the
-//! processor-control instructions (HLT, NOP, flag-control). Segment
-//! override/REP/LOCK prefixes, string instructions, far JMP/CALL, and
-//! indirect JMP/CALL through memory are not decoded yet.
+//! jumps, the LOOP family, near CALL/RET, INT/INT3/IRET, the
+//! processor-control instructions (HLT, NOP, flag-control), the shift/
+//! rotate group (D0-D3, and the 80186 C0/C1 immediate-count form), the
+//! F6/F7 unary group (TEST/NOT/NEG/MUL/IMUL/DIV/IDIV), the string
+//! instructions (MOVS/CMPS/STOS/LODS/SCAS) and the REP/REPE/REPNE
+//! prefixes that repeat them. Segment-override/LOCK prefixes, far JMP/
+//! CALL, and indirect JMP/CALL through memory are not decoded yet.
 
 mod groups;
 mod modrm;
@@ -16,7 +19,7 @@ mod text;
 pub use text::format_instruction;
 
 use modrm::decode_modrm;
-use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Width};
+use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Repeat, Width};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -412,10 +415,124 @@ fn simple(mnemonic: Mnemonic) -> Result<(Instruction, usize), DecodeError> {
     Ok((Instruction::new(mnemonic, vec![], None, 1), 1))
 }
 
+/// Where a shift/rotate instruction's count operand comes from: an
+/// implicit `1` (`D0`/`D1`), the `CL` register (`D2`/`D3`), or an 80186
+/// immediate byte (`C0`/`C1`).
+#[derive(Debug, Clone, Copy)]
+enum ShiftCountSource {
+    One,
+    Cl,
+    Imm8,
+}
+
+fn decode_shift_rotate(
+    bytes: &[u8],
+    width: Width,
+    count_source: ShiftCountSource,
+) -> Result<(Instruction, usize), DecodeError> {
+    let modrm = decode_modrm(&bytes[1..], width)?;
+    let mnemonic = groups::shift_rotate_group_from_reg_field(modrm.reg_field);
+    let modrm_len = 1 + modrm.consumed;
+    let (count_operand, len) = match count_source {
+        ShiftCountSource::One => (Operand::Immediate(1), modrm_len),
+        ShiftCountSource::Cl => (Operand::Reg8(Reg8::Cl), modrm_len),
+        ShiftCountSource::Imm8 => {
+            let imm = read_i8(bytes, modrm_len)? as i32;
+            (Operand::Immediate(imm), modrm_len + 1)
+        }
+    };
+    Ok((
+        Instruction::new(
+            mnemonic,
+            vec![modrm.rm_operand, count_operand],
+            Some(width),
+            len as u8,
+        ),
+        len,
+    ))
+}
+
+/// The `F6`/`F7` unary group: `TEST r/m, imm` (reg field 0/1), or the
+/// single-operand `NOT`/`NEG`/`MUL`/`IMUL`/`DIV`/`IDIV` (reg fields 2-7).
+fn decode_unary_group(bytes: &[u8], width: Width) -> Result<(Instruction, usize), DecodeError> {
+    let modrm = decode_modrm(&bytes[1..], width)?;
+    let mnemonic = groups::unary_group_from_reg_field(modrm.reg_field);
+    let modrm_len = 1 + modrm.consumed;
+    if mnemonic == Mnemonic::Test {
+        let (imm, imm_len) = match width {
+            Width::Byte => (read_i8(bytes, modrm_len)? as i32, 1),
+            Width::Word => (read_i16(bytes, modrm_len)? as i32, 2),
+        };
+        let len = modrm_len + imm_len;
+        return Ok((
+            Instruction::new(
+                mnemonic,
+                vec![modrm.rm_operand, Operand::Immediate(imm)],
+                Some(width),
+                len as u8,
+            ),
+            len,
+        ));
+    }
+    Ok((
+        Instruction::new(
+            mnemonic,
+            vec![modrm.rm_operand],
+            Some(width),
+            modrm_len as u8,
+        ),
+        modrm_len,
+    ))
+}
+
+fn is_string_mnemonic(mnemonic: Mnemonic) -> bool {
+    matches!(
+        mnemonic,
+        Mnemonic::Movsb
+            | Mnemonic::Movsw
+            | Mnemonic::Cmpsb
+            | Mnemonic::Cmpsw
+            | Mnemonic::Stosb
+            | Mnemonic::Stosw
+            | Mnemonic::Lodsb
+            | Mnemonic::Lodsw
+            | Mnemonic::Scasb
+            | Mnemonic::Scasw
+    )
+}
+
+/// `REPNE`/`REPNZ` is always `0xF2`. `0xF3` is `REP` on MOVS/STOS/LODS but
+/// means `REPE`/`REPZ` on CMPS/SCAS - the meaning genuinely depends on the
+/// trailing opcode, not the prefix byte, matching real 8086 semantics.
+fn decode_repeat_prefix(prefix: u8, bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
+    let (inner, inner_len) = decode_one(&bytes[1..])?;
+    if !is_string_mnemonic(inner.mnemonic) {
+        return Err(DecodeError::InvalidOpcode(prefix));
+    }
+    let repeat = if prefix == 0xF2 {
+        Repeat::Repne
+    } else if matches!(
+        inner.mnemonic,
+        Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Scasb | Mnemonic::Scasw
+    ) {
+        Repeat::Repe
+    } else {
+        Repeat::Rep
+    };
+    let len = 1 + inner_len;
+    let mut instr = inner.with_repeat(repeat);
+    instr.byte_len = len as u8;
+    Ok((instr, len))
+}
+
 /// Decode a single instruction starting at the front of `bytes`.
 /// Returns the instruction and how many bytes it consumed.
 pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
     let opcode = *bytes.first().ok_or(DecodeError::UnexpectedEndOfInput)?;
+
+    if opcode == 0xF2 || opcode == 0xF3 {
+        return decode_repeat_prefix(opcode, bytes);
+    }
 
     if is_arithmetic_group_opcode(opcode) {
         return decode_arithmetic_group_form(opcode, bytes);
@@ -505,12 +622,24 @@ pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
         0xA1 => decode_mov_acc_mem(bytes, Width::Word, Direction::ToReg),
         0xA2 => decode_mov_acc_mem(bytes, Width::Byte, Direction::ToRm),
         0xA3 => decode_mov_acc_mem(bytes, Width::Word, Direction::ToRm),
+        0xA4 => simple(Mnemonic::Movsb),
+        0xA5 => simple(Mnemonic::Movsw),
+        0xA6 => simple(Mnemonic::Cmpsb),
+        0xA7 => simple(Mnemonic::Cmpsw),
         0xA8 => decode_acc_imm(Mnemonic::Test, bytes, Width::Byte),
         0xA9 => decode_acc_imm(Mnemonic::Test, bytes, Width::Word),
+        0xAA => simple(Mnemonic::Stosb),
+        0xAB => simple(Mnemonic::Stosw),
+        0xAC => simple(Mnemonic::Lodsb),
+        0xAD => simple(Mnemonic::Lodsw),
+        0xAE => simple(Mnemonic::Scasb),
+        0xAF => simple(Mnemonic::Scasw),
 
         0xB0..=0xB7 => decode_mov_reg_imm(opcode, bytes, Width::Byte),
         0xB8..=0xBF => decode_mov_reg_imm(opcode, bytes, Width::Word),
 
+        0xC0 => decode_shift_rotate(bytes, Width::Byte, ShiftCountSource::Imm8),
+        0xC1 => decode_shift_rotate(bytes, Width::Word, ShiftCountSource::Imm8),
         0xC2 => decode_ret_imm(bytes),
         0xC3 => simple(Mnemonic::Ret),
         0xC6 => decode_mov_rm_imm(bytes, Width::Byte, opcode),
@@ -518,6 +647,11 @@ pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
         0xCC => simple(Mnemonic::Int3),
         0xCD => decode_int(bytes),
         0xCF => simple(Mnemonic::Iret),
+
+        0xD0 => decode_shift_rotate(bytes, Width::Byte, ShiftCountSource::One),
+        0xD1 => decode_shift_rotate(bytes, Width::Word, ShiftCountSource::One),
+        0xD2 => decode_shift_rotate(bytes, Width::Byte, ShiftCountSource::Cl),
+        0xD3 => decode_shift_rotate(bytes, Width::Word, ShiftCountSource::Cl),
 
         0xE0 => decode_rel8_branch(Mnemonic::Loopne, bytes),
         0xE1 => decode_rel8_branch(Mnemonic::Loope, bytes),
@@ -529,6 +663,8 @@ pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
 
         0xF4 => simple(Mnemonic::Hlt),
         0xF5 => simple(Mnemonic::Cmc),
+        0xF6 => decode_unary_group(bytes, Width::Byte),
+        0xF7 => decode_unary_group(bytes, Width::Word),
         0xF8 => simple(Mnemonic::Clc),
         0xF9 => simple(Mnemonic::Stc),
         0xFA => simple(Mnemonic::Cli),
@@ -955,6 +1091,152 @@ mod tests {
         assert_eq!(instr.mnemonic, Mnemonic::Int);
         assert_eq!(instr.operands, vec![Operand::Immediate(0x21)]);
         assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn decodes_shift_by_one_forms() {
+        // SHL AL, 1 -> D0 E0 (reg field 100 = SHL, rm=000=AL)
+        let (instr, len) = decode_one(&[0xD0, 0b11_100_000]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Shl);
+        assert_eq!(
+            instr.operands,
+            vec![Operand::Reg8(Reg8::Al), Operand::Immediate(1)]
+        );
+        assert_eq!(instr.width, Some(Width::Byte));
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn decodes_shift_by_cl_forms() {
+        // SAR DX, CL -> D3 FA (reg field 111 = SAR, rm=010=DX)
+        let (instr, len) = decode_one(&[0xD3, 0b11_111_010]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Sar);
+        assert_eq!(
+            instr.operands,
+            vec![Operand::Reg16(Reg16::Dx), Operand::Reg8(Reg8::Cl)]
+        );
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn decodes_shift_by_immediate_80186_form() {
+        // ROL AX, 4 -> C1 C0 04 (reg field 000 = ROL, rm=000=AX)
+        let (instr, len) = decode_one(&[0xC1, 0b11_000_000, 0x04]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Rol);
+        assert_eq!(
+            instr.operands,
+            vec![Operand::Reg16(Reg16::Ax), Operand::Immediate(4)]
+        );
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn decodes_all_eight_shift_rotate_reg_field_forms() {
+        let cases = [
+            (0b000, Mnemonic::Rol),
+            (0b001, Mnemonic::Ror),
+            (0b010, Mnemonic::Rcl),
+            (0b011, Mnemonic::Rcr),
+            (0b100, Mnemonic::Shl),
+            (0b101, Mnemonic::Shr),
+            (0b111, Mnemonic::Sar),
+        ];
+        for (reg_field, mnemonic) in cases {
+            let modrm = 0b11_000_000 | (reg_field << 3);
+            let (instr, _) = decode_one(&[0xD0, modrm]).unwrap();
+            assert_eq!(instr.mnemonic, mnemonic, "reg field {reg_field:#05b}");
+        }
+    }
+
+    #[test]
+    fn decodes_unary_group_mul_imul_div_idiv_neg_not() {
+        let cases = [
+            (0b010, Mnemonic::Not),
+            (0b011, Mnemonic::Neg),
+            (0b100, Mnemonic::Mul),
+            (0b101, Mnemonic::Imul),
+            (0b110, Mnemonic::Div),
+            (0b111, Mnemonic::Idiv),
+        ];
+        for (reg_field, mnemonic) in cases {
+            let modrm = 0b11_000_001 | (reg_field << 3); // rm = CX
+            let (instr, len) = decode_one(&[0xF7, modrm]).unwrap();
+            assert_eq!(instr.mnemonic, mnemonic, "reg field {reg_field:#05b}");
+            assert_eq!(instr.operands, vec![Operand::Reg16(Reg16::Cx)]);
+            assert_eq!(len, 2);
+        }
+    }
+
+    #[test]
+    fn decodes_unary_group_test_with_immediate() {
+        // TEST WORD [BX], 0x00FF -> F7 07 FF 00 (reg field 000 = TEST)
+        let (instr, len) = decode_one(&[0xF7, 0b00_000_111, 0xFF, 0x00]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Test);
+        assert_eq!(
+            instr.operands,
+            vec![
+                Operand::mem(Some(Reg16::Bx), None, 0),
+                Operand::Immediate(0xFF)
+            ]
+        );
+        assert_eq!(len, 4);
+    }
+
+    #[test]
+    fn decodes_string_instructions_as_zero_operand_forms() {
+        for (byte, mnemonic) in [
+            (0xA4, Mnemonic::Movsb),
+            (0xA5, Mnemonic::Movsw),
+            (0xA6, Mnemonic::Cmpsb),
+            (0xA7, Mnemonic::Cmpsw),
+            (0xAA, Mnemonic::Stosb),
+            (0xAB, Mnemonic::Stosw),
+            (0xAC, Mnemonic::Lodsb),
+            (0xAD, Mnemonic::Lodsw),
+            (0xAE, Mnemonic::Scasb),
+            (0xAF, Mnemonic::Scasw),
+        ] {
+            let (instr, len) = decode_one(&[byte]).unwrap();
+            assert_eq!(instr.mnemonic, mnemonic, "opcode {byte:#04x}");
+            assert!(instr.operands.is_empty());
+            assert_eq!(len, 1);
+        }
+    }
+
+    #[test]
+    fn decodes_rep_prefix_on_movsb() {
+        // REP MOVSB -> F3 A4
+        let (instr, len) = decode_one(&[0xF3, 0xA4]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Movsb);
+        assert_eq!(instr.repeat, Some(x8086_isa::Repeat::Rep));
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn f3_prefix_on_cmps_means_repe_not_rep() {
+        // REPE CMPSB -> F3 A6 (F3 means REPE, not unconditional REP, on CMPS)
+        let (instr, len) = decode_one(&[0xF3, 0xA6]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Cmpsb);
+        assert_eq!(instr.repeat, Some(x8086_isa::Repeat::Repe));
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn decodes_repne_prefix_on_scasb() {
+        // REPNE SCASB -> F2 AE
+        let (instr, len) = decode_one(&[0xF2, 0xAE]).unwrap();
+        assert_eq!(instr.mnemonic, Mnemonic::Scasb);
+        assert_eq!(instr.repeat, Some(x8086_isa::Repeat::Repne));
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn repeat_prefix_on_a_non_string_instruction_is_rejected() {
+        // F3 90 would be a REP NOP - not a real repeatable instruction.
+        assert_eq!(
+            decode_one(&[0xF3, 0x90]).unwrap_err(),
+            DecodeError::InvalidOpcode(0xF3)
+        );
     }
 
     #[test]

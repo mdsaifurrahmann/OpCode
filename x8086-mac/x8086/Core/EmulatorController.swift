@@ -66,6 +66,12 @@ final class EmulatorController: ObservableObject {
     var isHalted: Bool { executionState == .halted }
     var isWaitingForKeyboard: Bool { executionState == .waitingForKeyboard }
     var isRunning: Bool { executionState == .running }
+    /// SS:SP resolved to a physical (flat) address - what the Stack
+    /// panel needs to identify its own SP row, since SP alone isn't a
+    /// flat address once SS is nonzero.
+    var stackPointerPhysicalAddress: UInt32 {
+        Self.physicalAddress(segment: registers.ss, offset: registers.sp)
+    }
     /// Step Into/Over/Run-to-cursor are only meaningful while paused
     /// mid-program - not before anything is loaded, not while a run is
     /// already in flight, and not once halted (there is nothing left to
@@ -320,14 +326,24 @@ final class EmulatorController: ObservableObject {
         canStepBack = emulator.canStepBack()
         refreshWatchesAndVariables()
         disassembly = emulator.disassemble(address: UInt32(registers.ip), count: disassemblyWindowSize)
-        stack = (0..<stackWindowSize).map { offset in
+        stack = (0..<stackWindowSize).map { wordIndex in
             // `&+`: SP arithmetic genuinely wraps at the 16-bit boundary
             // on real 8086 hardware, matching `Memory`'s own addressing.
-            let address = registers.sp &+ UInt16(offset * 2)
-            let bytes = [UInt8](emulator.readMemory(address: UInt32(address), len: 2))
+            let offset = registers.sp &+ UInt16(wordIndex * 2)
+            let address = Self.physicalAddress(segment: registers.ss, offset: offset)
+            let bytes = [UInt8](emulator.readMemory(address: address, len: 2))
             let value = UInt16(bytes[0]) | (UInt16(bytes[1]) << 8)
-            return StackEntry(address: UInt32(address), value: value)
+            return StackEntry(address: address, value: value)
         }
+    }
+
+    /// `segment:offset` -> physical address, matching `Memory::resolve`
+    /// exactly (paragraph-shifted, wrapped at the 1MB boundary). The
+    /// Stack panel needs this itself (SP alone isn't a flat address once
+    /// SS is nonzero, which it now can be - see `assemble_and_load`'s
+    /// segment initialization).
+    private static func physicalAddress(segment: UInt16, offset: UInt16) -> UInt32 {
+        ((UInt32(segment) << 4) &+ UInt32(offset)) & 0x000F_FFFF
     }
 
     private func refreshWatchesAndVariables() {

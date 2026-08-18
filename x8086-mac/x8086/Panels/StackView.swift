@@ -5,7 +5,9 @@ import SwiftUI
 /// which is what a debugger's Stack panel is for.
 struct StackView: View {
     let entries: [StackEntry]
-    let stackPointer: UInt16
+    /// The physical (flat) address SS:SP resolves to - not the raw SP
+    /// value, since SP alone isn't a flat address once SS is nonzero.
+    let spPhysicalAddress: UInt32
 
     var body: some View {
         ScrollView {
@@ -15,7 +17,7 @@ struct StackView: View {
                         Text(String(format: "%04X:", entry.address))
                             .foregroundColor(.secondary)
                         Text(String(format: "%04X", entry.value))
-                        if entry.address == UInt32(stackPointer) {
+                        if entry.address == spPhysicalAddress {
                             Text("← SP")
                                 .foregroundColor(.accentColor)
                         }

@@ -14,7 +14,7 @@ fn mask_and_sign_bit(width: Width) -> (u32, u32) {
     }
 }
 
-fn parity_even(low_byte: u8) -> bool {
+pub(crate) fn parity_even(low_byte: u8) -> bool {
     low_byte.count_ones().is_multiple_of(2)
 }
 

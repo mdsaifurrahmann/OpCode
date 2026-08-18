@@ -142,6 +142,13 @@ pub struct Emulator {
     /// resolve named-variable watches and to drive the Variables panel.
     /// Empty until the first assemble.
     last_symbols: Vec<x8086_assembler::SymbolTableEntry>,
+    /// The data segment's flat base address from the most recent
+    /// assemble, needed because `last_symbols` entries for `Data`-kind
+    /// symbols are offsets *relative to that segment* (see
+    /// `x8086-assembler`'s codegen docs), not flat addresses - `0` when
+    /// the program never declared a `.DATA` section, which is exactly
+    /// correct since data-kind symbols can't exist without one.
+    data_segment_base: u32,
     /// Watch expressions as typed, in add order. Deliberately just
     /// strings, not pre-resolved targets - see `ResolvedWatch`. Cleared
     /// on `reset`/`assemble_and_load` like everything else in `Emulator`;
@@ -166,6 +173,7 @@ impl Emulator {
             pending_interrupt: None,
             diff_recorder,
             last_symbols: Vec::new(),
+            data_segment_base: 0,
             watch_expressions: Vec::new(),
         }
     }
@@ -199,11 +207,11 @@ impl Emulator {
         self.watch_expressions = watch_expressions;
     }
 
-    /// Load raw machine code starting at CS:IP = 0000:0000. Real segment
-    /// layout (matching emu8086's default `.MODEL SMALL` placement)
-    /// arrives once multi-segment layout matters to the emulator; today
-    /// everything lives in one flat image, matching the assembler's own
-    /// scope.
+    /// Load raw machine code starting at CS:IP = 0000:0000. Callers that
+    /// need real `.MODEL SMALL`-style segment setup (DS/SS/SP pointed at
+    /// a separate data/stack segment) should use `assemble_and_load`
+    /// instead, which does that on top of this - this method itself only
+    /// ever loads a single flat image starting at physical address 0.
     pub fn load_program(&mut self, machine_code: &[u8]) {
         self.reset();
         for (offset, byte) in machine_code.iter().enumerate() {
@@ -215,11 +223,31 @@ impl Emulator {
         self.drain_memory_diffs();
     }
 
+    /// Assembles `source` and loads it, then - unlike `load_program`
+    /// alone - initializes DS/SS/SP from any `.DATA`/`.STACK` segments
+    /// the source declared. DS is set to the data segment's paragraph
+    /// value even though real DOS never does this for you (that's what
+    /// the traditional `MOV AX,@DATA` / `MOV DS,AX` boilerplate is for) -
+    /// a deliberate compatibility choice: it makes programs that already
+    /// include that boilerplate work (they just redundantly re-set DS to
+    /// what it already was), *and* programs that omit it (common in
+    /// simple/tutorial code) work too, which a strictly DOS-accurate
+    /// "leave DS alone" behavior would not. A program with no `.DATA`/
+    /// `.STACK` at all sees no change here - DS/SS/SP all stay 0, exactly
+    /// as before this existed.
     pub fn assemble_and_load(&mut self, source: &str) -> x8086_assembler::AssembleResult {
         let result = x8086_assembler::assemble(source);
         self.load_program(&result.machine_code);
         self.registers.ip = result.entry_point as u16;
         self.last_symbols = result.symbols.clone();
+        self.data_segment_base = result.data_segment_base.unwrap_or(0);
+        if let Some(data_base) = result.data_segment_base {
+            self.registers.ds = (data_base / 16) as u16;
+        }
+        if let Some((stack_base, stack_size)) = result.stack_segment {
+            self.registers.ss = (stack_base / 16) as u16;
+            self.registers.sp = stack_size as u16;
+        }
         result
     }
 
@@ -407,7 +435,10 @@ impl Emulator {
         self.last_symbols
             .iter()
             .filter_map(|symbol| {
-                let address = symbol.value as u32;
+                // `symbol.value` is an offset relative to the data
+                // segment (see x8086-assembler's codegen docs) - add its
+                // base to get the real flat address to read.
+                let address = symbol.value as u32 + self.data_segment_base;
                 match symbol.kind {
                     x8086_assembler::SymbolKind::DataByte => Some(VariableValue {
                         name: symbol.name.clone(),
@@ -452,13 +483,13 @@ impl Emulator {
         Some(match symbol.kind {
             x8086_assembler::SymbolKind::DataByte => {
                 ResolvedWatch::Live(x8086_debugger::watch::WatchTarget::Memory {
-                    address: symbol.value as u32,
+                    address: symbol.value as u32 + self.data_segment_base,
                     size: x8086_debugger::watch::WatchSize::Byte,
                 })
             }
             x8086_assembler::SymbolKind::DataWord => {
                 ResolvedWatch::Live(x8086_debugger::watch::WatchTarget::Memory {
-                    address: symbol.value as u32,
+                    address: symbol.value as u32 + self.data_segment_base,
                     size: x8086_debugger::watch::WatchSize::Word,
                 })
             }
@@ -1079,5 +1110,128 @@ HLT
                 byte_len: 1
             }
         );
+    }
+
+    #[test]
+    fn model_small_program_with_boilerplate_initializes_segments_and_runs_correctly() {
+        let mut emulator = Emulator::new();
+        let source = "\
+.MODEL SMALL
+.STACK 100h
+.DATA
+msg DB \"Hi$\"
+.CODE
+start:
+MOV AX, @DATA
+MOV DS, AX
+LEA DX, msg
+MOV AH, 9
+INT 21h
+MOV AH, 4Ch
+INT 21h
+END start
+";
+        let result = emulator.assemble_and_load(source);
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        assert_ne!(
+            emulator.registers.ds, 0,
+            "DS must point at the data segment"
+        );
+        assert_ne!(
+            emulator.registers.ss, 0,
+            "SS must point at the stack segment"
+        );
+        assert_eq!(
+            emulator.registers.sp, 0x100,
+            "SP must start at the declared stack size"
+        );
+
+        loop {
+            match emulator.step().unwrap() {
+                // INT 21h AH=4Ch (terminate) reports Halted too, exactly
+                // like a real HLT - it's the program's normal exit here.
+                StepOutcome::Halted => break,
+                StepOutcome::Continued => {}
+                StepOutcome::WaitingForKeyboard => panic!("unexpected keyboard wait"),
+            }
+        }
+        assert_eq!(emulator.console_output(), "Hi");
+    }
+
+    #[test]
+    fn model_small_program_without_the_boilerplate_still_works() {
+        // Real DOS requires MOV AX,@DATA/MOV DS,AX, but this emulator
+        // auto-initializes DS to the data segment specifically so
+        // programs that skip that boilerplate (common in simple/tutorial
+        // emu8086 code) still resolve variables correctly.
+        let mut emulator = Emulator::new();
+        let source = "\
+.MODEL SMALL
+.DATA
+msg DB \"Hi$\"
+.CODE
+start:
+LEA DX, msg
+MOV AH, 9
+INT 21h
+MOV AH, 4Ch
+INT 21h
+END start
+";
+        let result = emulator.assemble_and_load(source);
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        loop {
+            match emulator.step().unwrap() {
+                StepOutcome::Halted => break,
+                StepOutcome::Continued => {}
+                StepOutcome::WaitingForKeyboard => panic!("unexpected keyboard wait"),
+            }
+        }
+        assert_eq!(emulator.console_output(), "Hi");
+    }
+
+    #[test]
+    fn flat_style_program_without_directives_still_starts_with_all_segments_zero() {
+        // Backward-compatibility guard: a program that never uses
+        // .MODEL/.STACK/.DATA/.CODE must see zero change in segment
+        // register initialization.
+        let mut emulator = Emulator::new();
+        emulator.assemble_and_load("MOV AX, 1\nHLT\n");
+        assert_eq!(emulator.registers.ds, 0);
+        assert_eq!(emulator.registers.ss, 0);
+        assert_eq!(emulator.registers.sp, 0);
+    }
+
+    #[test]
+    fn variables_reads_the_correct_flat_address_once_a_real_data_segment_exists() {
+        let mut emulator = Emulator::new();
+        let result = emulator.assemble_and_load(".CODE\nMOV AX, 1\nHLT\n.DATA\nvalue DB 42\n");
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        let data_base = result.data_segment_base.expect("a .DATA section was used");
+        let vars = emulator.variables();
+        let value = vars
+            .iter()
+            .find(|v| v.name == "value")
+            .expect("value variable");
+        assert_eq!(
+            value.address, data_base,
+            "must be the true flat address, not the segment-relative offset"
+        );
+        assert_eq!(value.value, 42);
     }
 }

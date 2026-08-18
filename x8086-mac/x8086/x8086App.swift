@@ -6,6 +6,26 @@ struct X8086App: App {
     @StateObject private var emulatorController = EmulatorController()
     @Environment(\.openWindow) private var openWindow
 
+    init() {
+        // macOS's "add period with double-space" substitution isn't
+        // gated by any of NSTextView's own isAutomatic*Enabled flags
+        // (SourceEditorView already disables every one of those) - it's
+        // a separate, lower-level behavior keyed off this user default.
+        // Without this, assembly source using multiple spaces for
+        // column alignment (extremely common emu8086/NASM style,
+        // including in real tutorial code) gets silently corrupted as
+        // it's typed: "msg  db" becomes "msg. db".
+        //
+        // `set(_:forKey:)`, not `register(defaults:)`: this app's own
+        // preferences domain outranks `NSGlobalDomain` in the search
+        // order, while `register(defaults:)` only installs a lowest-
+        // priority fallback - which a user who has actually turned this
+        // feature on system-wide (i.e. exactly the state that triggers
+        // this bug) stores in `NSGlobalDomain`, outranking a mere
+        // fallback and leaving it in effect. `set` actually overrides it.
+        UserDefaults.standard.set(false, forKey: "NSAutomaticPeriodSubstitutionEnabled")
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
