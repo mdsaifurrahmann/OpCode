@@ -107,6 +107,78 @@ jobs:
         working-directory: x8086-mac
         run: xcodebuild -project x8086.xcodeproj -scheme x8086 -destination 'platform=macOS' -only-testing:x8086UITests test
 
-  # Job 5 (release: codesign, notarize, package .dmg) lands once the project
-  # reaches the hardening/release phase - it needs a real Developer ID
-  # certificate, which doesn't exist yet.
+  # Job 5: codesign, notarize, and package a .dmg, then attach it to a
+  # GitHub Release. Only runs on version tags (v1.0.0 etc.), never on
+  # every push/PR like jobs 1-4 - a signing/notarization run costs real
+  # time and touches secrets, so it should be a deliberate act (pushing a
+  # tag), not something that fires on every commit.
+  #
+  # Requires these repo secrets, none of which exist yet (see
+  # scripts/release-dmg.sh's header for how to obtain each one):
+  #   DEVELOPER_ID_CERTIFICATE_P12   - base64 of a .p12 export of your
+  #                                    Developer ID Application cert + key
+  #                                    (Keychain Access > select both the
+  #                                    cert and its key > right-click >
+  #                                    Export 2 Items…, then `base64 -i`)
+  #   DEVELOPER_ID_CERTIFICATE_PASSWORD - the password you set on that .p12
+  #   DEVELOPER_TEAM_ID              - developer.apple.com/account > Membership
+  #   NOTARIZATION_APPLE_ID          - the Apple ID enrolled in the
+  #                                    Developer Program
+  #   NOTARIZATION_APP_PASSWORD      - an app-specific password for that
+  #                                    Apple ID, from appleid.apple.com
+  #                                    (not the Apple ID password itself)
+  # Until these are added under Settings > Secrets and variables > Actions,
+  # this job will fail immediately at the "Import signing certificate"
+  # step - expected, not a regression, until Developer ID enrollment
+  # happens.
+  release:
+    name: Release (sign, notarize, package .dmg)
+    runs-on: macos-latest
+    needs: [rust-checks, xcode-unit-tests, xcode-e2e-tests]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          echo "$P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k build.keychain -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security list-keychains -d user -s build.keychain login.keychain
+          rm -f /tmp/cert.p12
+
+      - name: Store notarytool credentials
+        env:
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          APP_PASSWORD: ${{ secrets.NOTARIZATION_APP_PASSWORD }}
+          TEAM_ID: ${{ secrets.DEVELOPER_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials "opcode-notary" \
+            --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$APP_PASSWORD"
+
+      - name: Build, sign, package, notarize, staple
+        env:
+          DEVELOPER_TEAM_ID: ${{ secrets.DEVELOPER_TEAM_ID }}
+        run: ./scripts/release-dmg.sh
+
+      - name: Upload .dmg to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/release/OpCode-*.dmg

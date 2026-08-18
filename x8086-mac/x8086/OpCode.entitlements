@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Direct distribution outside the App Store means no App Sandbox, so
+	this is intentionally near-empty: hardened runtime (enabled via
+	ENABLE_HARDENED_RUNTIME in project.yml, required for notarization)
+	already applies its baseline restrictions - no JIT, no unsigned
+	executable memory, no DYLD env var injection - with zero entries
+	needed here, since this app does none of the things that would
+	require opting back out of those restrictions (no JIT compilation,
+	the Rust core is a statically linked .a, not a loaded dylib, and
+	file access goes through user-driven NSOpenPanel/NSSavePanel, which
+	needs no entitlement at all outside the sandbox).
+	-->
+</dict>
+</plist>

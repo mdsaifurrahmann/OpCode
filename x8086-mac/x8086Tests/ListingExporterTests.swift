@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import x8086
+@testable import OpCode
 
 final class ListingExporterTests: XCTestCase {
     func testGeneratesOneRowPerCodeProducingLineWithItsAddressAndBytes() {
@@ -41,6 +41,6 @@ final class ListingExporterTests: XCTestCase {
             machineCodeLength: 0,
             readMemory: { _, _ in Data() }
         )
-        XCTAssertEqual(listing, "x8086 Listing\n\n")
+        XCTAssertEqual(listing, "OpCode Listing\n\n")
     }
 }

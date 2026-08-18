@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import x8086
+@testable import OpCode
 
 final class SyntaxHighlighterTests: XCTestCase {
     private func tokens(for source: String) -> [Token] {

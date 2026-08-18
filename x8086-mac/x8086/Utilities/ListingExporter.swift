@@ -17,7 +17,7 @@ enum ListingExporter {
         let sortedMappings = lineToAddress.sorted { $0.line < $1.line }
         let sourceLines = source.components(separatedBy: "\n")
 
-        var output = "x8086 Listing\n\n"
+        var output = "OpCode Listing\n\n"
         for (index, mapping) in sortedMappings.enumerated() {
             let nextAddress =
                 index + 1 < sortedMappings.count ? sortedMappings[index + 1].address : machineCodeLength

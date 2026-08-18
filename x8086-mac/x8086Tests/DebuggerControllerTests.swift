@@ -1,6 +1,6 @@
 import XCTest
 
-@testable import x8086
+@testable import OpCode
 
 /// Controller-level correctness for the Phase 6 debugger surface,
 /// exercising the real `EmulatorController` (backed by the real Rust

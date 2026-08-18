@@ -1,6 +1,6 @@
 name: x8086
 options:
-  bundleIdPrefix: com.saifurrahmann.x8086
+  bundleIdPrefix: com.saifurrahmann.opcode
   deploymentTarget:
     macOS: "13.0"
 configs:
@@ -16,15 +16,61 @@ targets:
         optional: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.saifurrahmann.x8086
+        PRODUCT_NAME: OpCode
+        PRODUCT_BUNDLE_IDENTIFIER: com.saifurrahmann.opcode
         MACOSX_DEPLOYMENT_TARGET: "13.0"
         SWIFT_VERSION: "5.0"
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: x8086
+        CODE_SIGN_ENTITLEMENTS: x8086/OpCode.entitlements
         CURRENT_PROJECT_VERSION: "1"
         MARKETING_VERSION: "0.1.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Intentionally NOT setting DEVELOPMENT_TEAM here: this file is
+        # committed to git, and a personal Team ID has no business living
+        # in version control. scripts/release-dmg.sh passes it as a
+        # `DEVELOPMENT_TEAM=...` override at archive time instead. Debug
+        # builds (this session's whole verification history) don't need
+        # it - Automatic signing falls back to ad-hoc/local signing fine
+        # without a team.
+    # Replaces the simpler `GENERATE_INFOPLIST_FILE: YES` (which can only
+    # synthesize a plist from flat INFOPLIST_KEY_* string settings) -
+    # CFBundleDocumentTypes/UTExportedTypeDeclarations are arrays of
+    # dictionaries, so they need an actual generated Info.plist, which
+    # this XcodeGen `info:` block produces. Without this, the app has no
+    # file association at all: double-clicking a .asm file in Finder,
+    # dragging one onto the Dock icon, or "Open With" never offers or
+    # launches this app - File > Open inside the app is the only way in.
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleName: OpCode
+        CFBundleDisplayName: OpCode
+        # XcodeGen's own default for a hand-authored `info:` block
+        # hardcodes these to a literal "1.0"/"1" rather than wiring them
+        # to the build settings below - caught by the release .dmg
+        # actually landing on disk labeled "OpCode-1.0" instead of
+        # "OpCode-0.1.0". `$(...)` here really is substituted by Xcode's
+        # standard Info.plist processing at build time, same as it would
+        # be for a plist written by hand - it's a preprocessing step, not
+        # something specific to GENERATE_INFOPLIST_FILE.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: "8086 Assembly Source"
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - com.saifurrahmann.opcode.asm
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.saifurrahmann.opcode.asm
+            UTTypeDescription: "8086 Assembly Source"
+            UTTypeConformsTo:
+              - public.plain-text
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - asm
     dependencies:
       - framework: ../build/x8086FFI.xcframework
         embed: false
@@ -42,6 +88,12 @@ targets:
       base:
         SWIFT_VERSION: "5.0"
         GENERATE_INFOPLIST_FILE: YES
+        # XcodeGen derives these from the host target's *name* (x8086),
+        # not its `PRODUCT_NAME` override (OpCode) - without pinning them
+        # explicitly, the test bundle looks for a host app that no longer
+        # exists on disk.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/OpCode.app/Contents/MacOS/OpCode"
+        BUNDLE_LOADER: "$(TEST_HOST)"
     dependencies:
       - target: x8086
   x8086UITests:
