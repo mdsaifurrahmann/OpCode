@@ -10,6 +10,7 @@
 
 pub mod ast;
 mod codegen;
+pub use codegen::SymbolKind;
 mod encoder;
 mod expr_parser;
 mod mnemonics;
@@ -216,11 +217,12 @@ pub struct Diagnostic {
 }
 
 /// A resolved symbol (label, `EQU` constant, or data variable), exposed
-/// for a future Variables/Watch panel.
+/// for the Variables/Watch panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolTableEntry {
     pub name: String,
     pub value: i64,
+    pub kind: SymbolKind,
 }
 
 /// The result of assembling a source file: the encoded program, a

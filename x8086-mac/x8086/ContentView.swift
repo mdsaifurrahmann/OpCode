@@ -11,47 +11,110 @@ msg DB "Hello, x8086!$"
 struct ContentView: View {
     @StateObject private var controller = EmulatorController()
     @State private var sourceCode: String = defaultSample
+    @State private var tokens: [Token] = []
+    @State private var breakpointLines: Set<Int> = []
+    @State private var scrollToLine: Int?
     @State private var keyboardInput: String = ""
+    @State private var selectedDisassemblyAddress: UInt32?
 
     var body: some View {
-        HSplitView {
-            editorPane
-            outputPane
+        VStack(spacing: 0) {
+            DebuggerToolbar(
+                controller: controller,
+                onRun: { controller.run(source: sourceCode, breakpointLines: breakpointLines) },
+                onRestart: { controller.restart(source: sourceCode, breakpointLines: breakpointLines) },
+                onRunToCursor: {
+                    if let address = selectedDisassemblyAddress {
+                        controller.runToCursor(address: address)
+                    }
+                },
+                canRunToCursor: selectedDisassemblyAddress != nil
+            )
+            Divider()
+            HSplitView {
+                editorPane
+                inspectorPane
+            }
+            Divider()
+            HSplitView {
+                outputPane
+                MemoryView(controller: controller)
+                    .frame(minWidth: 260)
+                StackView(entries: controller.stack, stackPointer: controller.registers.sp)
+                    .frame(minWidth: 160)
+            }
+            .frame(height: 220)
         }
-        .frame(minWidth: 720, minHeight: 420)
+        .frame(minWidth: 1150, minHeight: 760)
+        .onAppear { tokens = controller.tokenize(sourceCode) }
+        // One-parameter form: the two-parameter onChange(of:) overload
+        // needs macOS 14+, and this project targets macOS 13.
+        .onChange(of: sourceCode) { newValue in
+            tokens = controller.tokenize(newValue)
+        }
     }
 
     private var editorPane: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Source").font(.headline)
-            TextEditor(text: $sourceCode)
-                .font(.system(.body, design: .monospaced))
-                .accessibilityIdentifier("sourceEditor")
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
-
-            Button("Assemble && Run") {
-                controller.run(source: sourceCode)
-            }
-            .accessibilityIdentifier("runButton")
-            .keyboardShortcut(.return, modifiers: .command)
+            SourceEditorView(
+                text: $sourceCode,
+                breakpointLines: $breakpointLines,
+                scrollToLine: $scrollToLine,
+                tokens: tokens,
+                diagnostics: controller.diagnostics,
+                currentExecutionLine: controller.currentExecutionLine
+            )
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
 
             if !controller.diagnostics.isEmpty {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(controller.diagnostics.enumerated()), id: \.offset) { _, diagnostic in
-                            Text("Line \(diagnostic.line): \(diagnostic.message)")
-                                .foregroundColor(diagnostic.isError ? .red : .orange)
-                                .font(.system(.caption, design: .monospaced))
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                ErrorListView(diagnostics: controller.diagnostics) { diagnostic in
+                    scrollToLine = Int(diagnostic.line)
                 }
-                .accessibilityIdentifier("diagnosticsList")
                 .frame(maxHeight: 100)
             }
         }
         .padding()
-        .frame(minWidth: 340)
+        .frame(minWidth: 380)
+    }
+
+    private var inspectorPane: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                sectionHeader("Registers")
+                RegistersView(registers: controller.registers) { controller.setRegisters($0) }
+
+                sectionHeader("Flags")
+                FlagsView(flags: controller.registers.flags)
+
+                if controller.isHalted {
+                    Text("Halted").foregroundColor(.green).accessibilityIdentifier("haltedLabel")
+                }
+
+                sectionHeader("Disassembly")
+                DisassemblyView(
+                    lines: controller.disassembly,
+                    currentAddress: UInt32(controller.registers.ip),
+                    selectedAddress: $selectedDisassemblyAddress
+                )
+                .frame(height: 220)
+
+                sectionHeader("Variables")
+                VariablesView(variables: controller.variables)
+                    .frame(height: 100)
+
+                sectionHeader("Watches")
+                WatchListView(
+                    watches: controller.watches,
+                    error: controller.watchError,
+                    onAdd: { controller.addWatch($0) },
+                    onRemove: { controller.removeWatch(at: $0) }
+                )
+                .frame(height: 140)
+            }
+            .padding()
+        }
+        .frame(minWidth: 320)
     }
 
     private var outputPane: some View {
@@ -63,7 +126,6 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityIdentifier("consoleOutputLabel")
             }
-            .frame(minHeight: 120)
             .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.gray.opacity(0.3)))
 
             if controller.isWaitingForKeyboard {
@@ -75,19 +137,13 @@ struct ContentView: View {
                     Text("waiting for keyboard input").foregroundColor(.secondary)
                 }
             }
-
-            if controller.isHalted {
-                Text("Halted").foregroundColor(.green).accessibilityIdentifier("haltedLabel")
-            }
-
-            Text("Registers").font(.headline)
-            RegistersGrid(registers: controller.registers)
-                .accessibilityIdentifier("registersGrid")
-
-            Spacer()
         }
         .padding()
-        .frame(minWidth: 320)
+        .frame(minWidth: 300)
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title).font(.subheadline).bold()
     }
 
     private func sendKeyboardInput() {
@@ -95,28 +151,6 @@ struct ContentView: View {
             controller.sendKey(character)
         }
         keyboardInput = ""
-    }
-}
-
-private struct RegistersGrid: View {
-    let registers: Registers
-
-    private var pairs: [(String, UInt16)] {
-        [
-            ("AX", registers.ax), ("BX", registers.bx), ("CX", registers.cx), ("DX", registers.dx),
-            ("SI", registers.si), ("DI", registers.di), ("BP", registers.bp), ("SP", registers.sp),
-            ("CS", registers.cs), ("DS", registers.ds), ("ES", registers.es), ("SS", registers.ss),
-            ("IP", registers.ip), ("FLAGS", registers.flags),
-        ]
-    }
-
-    var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 8)], alignment: .leading, spacing: 4) {
-            ForEach(pairs, id: \.0) { name, value in
-                Text("\(name): \(String(format: "%04X", value))")
-                    .font(.system(.caption, design: .monospaced))
-            }
-        }
     }
 }
 

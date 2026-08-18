@@ -185,6 +185,30 @@ fn db_and_dw_variables_are_addressable_by_name() {
 }
 
 #[test]
+fn symbol_table_distinguishes_data_byte_word_label_and_constant_kinds() {
+    use x8086_assembler::SymbolKind;
+
+    let result = assemble("SIZE EQU 4\nmsg DB \"hi\", 0\ncount DW 42\nstart: NOP\nEND start");
+    assert!(
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result.diagnostics
+    );
+    let kind_of = |name: &str| {
+        result
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no symbol named {name}"))
+            .kind
+    };
+    assert_eq!(kind_of("SIZE"), SymbolKind::Constant);
+    assert_eq!(kind_of("msg"), SymbolKind::DataByte);
+    assert_eq!(kind_of("count"), SymbolKind::DataWord);
+    assert_eq!(kind_of("start"), SymbolKind::Label);
+}
+
+#[test]
 fn end_with_label_sets_the_entry_point() {
     // HLT is 1 byte, so `main` sits at address 1.
     let result = assemble("HLT\nmain: NOP\nEND main");

@@ -10,6 +10,8 @@
 use std::collections::{BTreeSet, VecDeque};
 use x8086_cpu::Registers;
 
+pub mod watch;
+
 #[derive(Debug, Default)]
 pub struct Breakpoints {
     addresses: BTreeSet<u32>,

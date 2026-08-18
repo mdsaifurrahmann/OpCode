@@ -24,9 +24,10 @@ final class X8086Tests: XCTestCase {
     }
 
     @MainActor
-    func testEmulatorControllerPublishesRegistersAndConsoleOutputAfterRun() {
+    func testEmulatorControllerPublishesRegistersAndConsoleOutputAfterRun() async {
         let controller = EmulatorController()
-        controller.run(source: "MOV DX, 65\nMOV AH, 2\nINT 21h\nHLT\n") // AL/DL=65='A'
+        controller.run(source: "MOV DX, 65\nMOV AH, 2\nINT 21h\nHLT\n", breakpointLines: []) // AL/DL=65='A'
+        await controller.waitUntilIdle()
         XCTAssertTrue(controller.diagnostics.isEmpty, "unexpected diagnostics: \(controller.diagnostics)")
         XCTAssertTrue(controller.isHalted)
         XCTAssertEqual(controller.consoleOutput, "A")

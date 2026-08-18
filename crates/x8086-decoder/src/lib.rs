@@ -11,6 +11,9 @@
 
 mod groups;
 mod modrm;
+mod text;
+
+pub use text::format_instruction;
 
 use modrm::decode_modrm;
 use x8086_isa::{Condition, Instruction, Mnemonic, Operand, Reg16, Reg8, Width};

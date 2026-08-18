@@ -50,6 +50,29 @@ pub enum StepResult {
     },
 }
 
+/// The reason a `run`/`run_to_cursor` call stopped.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum RunResult {
+    Halted,
+    WaitingForKeyboard,
+    BreakpointHit,
+    DecodeError,
+    /// Hit the step ceiling without otherwise stopping - a runaway
+    /// program, not a real stopping condition. The caller may call `run`
+    /// again to keep going.
+    StepLimitReached,
+}
+
+fn convert_run_outcome(outcome: x8086_emulator::RunOutcome) -> RunResult {
+    match outcome {
+        x8086_emulator::RunOutcome::Halted => RunResult::Halted,
+        x8086_emulator::RunOutcome::WaitingForKeyboard => RunResult::WaitingForKeyboard,
+        x8086_emulator::RunOutcome::BreakpointHit => RunResult::BreakpointHit,
+        x8086_emulator::RunOutcome::DecodeError => RunResult::DecodeError,
+        x8086_emulator::RunOutcome::StepLimitReached => RunResult::StepLimitReached,
+    }
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub line: u32,
@@ -58,11 +81,22 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// One entry of the assembler's source-line <-> address map. A flat
+/// `Vec` rather than a `HashMap`, since uniffi's map support is
+/// string-keyed only and Swift builds its own `Dictionary` from this in
+/// the one place (the editor) that needs O(1) lookups.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct LineAddress {
+    pub line: u32,
+    pub address: u32,
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct AssembleResult {
     pub machine_code_len: u32,
     pub entry_point: u32,
     pub diagnostics: Vec<Diagnostic>,
+    pub line_to_address: Vec<LineAddress>,
 }
 
 fn convert_diagnostic(d: x8086_assembler::Diagnostic) -> Diagnostic {
@@ -74,8 +108,134 @@ fn convert_diagnostic(d: x8086_assembler::Diagnostic) -> Diagnostic {
     }
 }
 
+/// One row of the Watch panel. `value` is `None` when the expression no
+/// longer resolves (most commonly, a variable-name watch surviving past
+/// a reassemble that removed that symbol).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct WatchValue {
+    pub expression: String,
+    pub value: Option<u16>,
+}
+
+fn convert_watch_value(w: x8086_emulator::WatchValue) -> WatchValue {
+    WatchValue {
+        expression: w.expression,
+        value: w.value,
+    }
+}
+
+/// One row of the Variables panel: a `DB`/`DW` symbol with its live
+/// value read back from memory.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct VariableValue {
+    pub name: String,
+    pub address: u32,
+    pub value: u16,
+    pub is_word: bool,
+}
+
+fn convert_variable_value(v: x8086_emulator::VariableValue) -> VariableValue {
+    VariableValue {
+        name: v.name,
+        address: v.address,
+        value: v.value,
+        is_word: v.is_word,
+    }
+}
+
+/// One instruction from the Disassembly panel.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct DisassembledLine {
+    pub address: u32,
+    pub text: String,
+    pub byte_len: u32,
+}
+
+fn convert_disassembled_line(l: x8086_emulator::DisassembledLine) -> DisassembledLine {
+    DisassembledLine {
+        address: l.address,
+        text: l.text,
+        byte_len: l.byte_len,
+    }
+}
+
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenKind {
+    Identifier,
+    Register,
+    Number,
+    StringLiteral,
+    Comment,
+    Punctuation,
+    Newline,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub text: String,
+    pub line: u32,
+    pub col: u32,
+    pub len: u32,
+    /// UTF-8 byte offset from the start of the source. Assembly source
+    /// is overwhelmingly ASCII, where a byte offset and a UTF-16 offset
+    /// coincide - which is exactly what Swift's `NSRange`/`NSAttributedString`
+    /// need, so the editor can use this directly without re-deriving it
+    /// by walking the string itself.
+    pub byte_offset: u32,
+}
+
+fn convert_token_kind(kind: x8086_assembler::TokenKind) -> TokenKind {
+    match kind {
+        x8086_assembler::TokenKind::Identifier => TokenKind::Identifier,
+        x8086_assembler::TokenKind::Register => TokenKind::Register,
+        x8086_assembler::TokenKind::Number => TokenKind::Number,
+        x8086_assembler::TokenKind::StringLiteral => TokenKind::StringLiteral,
+        x8086_assembler::TokenKind::Comment => TokenKind::Comment,
+        x8086_assembler::TokenKind::Punctuation => TokenKind::Punctuation,
+        x8086_assembler::TokenKind::Newline => TokenKind::Newline,
+    }
+}
+
+/// Tokenizes `source` the exact same way the assembler itself does, so
+/// the editor's syntax highlighting can never drift from what actually
+/// assembles - reused directly rather than a separate Swift-side lexer.
+#[uniffi::export]
+pub fn tokenize_source(source: String) -> Vec<Token> {
+    x8086_assembler::tokenize(&source)
+        .into_iter()
+        .map(|t| Token {
+            kind: convert_token_kind(t.kind),
+            text: t.text,
+            line: t.span.line,
+            col: t.span.col,
+            len: t.span.len,
+            byte_offset: t.span.byte_offset,
+        })
+        .collect()
+}
+
 fn convert_registers(regs: x8086_cpu::Registers) -> Registers {
     Registers {
+        ax: regs.ax,
+        bx: regs.bx,
+        cx: regs.cx,
+        dx: regs.dx,
+        sp: regs.sp,
+        bp: regs.bp,
+        si: regs.si,
+        di: regs.di,
+        cs: regs.cs,
+        ds: regs.ds,
+        es: regs.es,
+        ss: regs.ss,
+        ip: regs.ip,
+        flags: regs.flags,
+    }
+}
+
+fn convert_registers_to_core(regs: Registers) -> x8086_cpu::Registers {
+    x8086_cpu::Registers {
         ax: regs.ax,
         bx: regs.bx,
         cx: regs.cx,
@@ -122,6 +282,11 @@ impl Emulator {
                 .into_iter()
                 .map(convert_diagnostic)
                 .collect(),
+            line_to_address: result
+                .line_to_address
+                .into_iter()
+                .map(|(line, address)| LineAddress { line, address })
+                .collect(),
         }
     }
 
@@ -151,6 +316,114 @@ impl Emulator {
 
     pub fn halted(&self) -> bool {
         self.inner.lock().unwrap().halted
+    }
+
+    /// Overwrites the whole register file - the Registers panel's
+    /// live-edit path.
+    pub fn set_registers(&self, registers: Registers) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_registers(convert_registers_to_core(registers));
+    }
+
+    /// Undo the most recent step. Returns false (a no-op, not an error)
+    /// if there is no history left to undo.
+    pub fn step_back(&self) -> bool {
+        self.inner.lock().unwrap().step_back()
+    }
+
+    pub fn can_step_back(&self) -> bool {
+        self.inner.lock().unwrap().can_step_back()
+    }
+
+    /// Steps repeatedly until the program halts, blocks on keyboard
+    /// input, hits a set breakpoint, hits a decode error, or `max_steps`
+    /// is reached.
+    pub fn run(&self, max_steps: u32) -> RunResult {
+        convert_run_outcome(self.inner.lock().unwrap().run(max_steps))
+    }
+
+    /// Runs until `address` is reached, a real breakpoint is hit first,
+    /// or the program halts/blocks/errors - the Run-to-cursor command.
+    pub fn run_to_cursor(&self, address: u32, max_steps: u32) -> RunResult {
+        convert_run_outcome(self.inner.lock().unwrap().run_to_cursor(address, max_steps))
+    }
+
+    /// Toggles a breakpoint at `address`, returning whether it is now
+    /// set (was previously absent).
+    pub fn toggle_breakpoint(&self, address: u32) -> bool {
+        self.inner.lock().unwrap().breakpoints.toggle(address)
+    }
+
+    pub fn is_breakpoint_set(&self, address: u32) -> bool {
+        self.inner.lock().unwrap().breakpoints.is_set(address)
+    }
+
+    pub fn clear_breakpoints(&self) {
+        self.inner.lock().unwrap().breakpoints.clear_all();
+    }
+
+    /// Reads up to `len` bytes starting at `address` - the Memory/Stack
+    /// panels' on-demand, visible-range-only read path.
+    pub fn read_memory(&self, address: u32, len: u32) -> Vec<u8> {
+        self.inner.lock().unwrap().read_memory(address, len)
+    }
+
+    /// Live-edits one memory cell - the Memory panel's write path.
+    pub fn write_memory_byte(&self, address: u32, value: u8) {
+        self.inner.lock().unwrap().write_memory_byte(address, value);
+    }
+
+    /// Every `DB`/`DW` symbol from the last assemble, with its current
+    /// value - the Variables panel's data source.
+    pub fn variables(&self) -> Vec<VariableValue> {
+        self.inner
+            .lock()
+            .unwrap()
+            .variables()
+            .into_iter()
+            .map(convert_variable_value)
+            .collect()
+    }
+
+    /// Adds a watch expression (a register/flag name, `byte`/`word
+    /// [addr]`, or a variable name from the last assemble). Returns an
+    /// error message on failure rather than throwing, matching this
+    /// crate's existing convention of surfacing user-facing failures as
+    /// data (see `StepResult::DecodeError`) rather than exceptions.
+    pub fn add_watch(&self, expression: String) -> Option<String> {
+        self.inner.lock().unwrap().add_watch(&expression).err()
+    }
+
+    pub fn remove_watch(&self, index: u32) {
+        self.inner.lock().unwrap().remove_watch(index as usize);
+    }
+
+    pub fn clear_watches(&self) {
+        self.inner.lock().unwrap().clear_watches();
+    }
+
+    pub fn watch_values(&self) -> Vec<WatchValue> {
+        self.inner
+            .lock()
+            .unwrap()
+            .watch_values()
+            .into_iter()
+            .map(convert_watch_value)
+            .collect()
+    }
+
+    /// Disassembles `count` instructions forward from `address` - the
+    /// Disassembly panel's data source.
+    pub fn disassemble(&self, address: u32, count: u32) -> Vec<DisassembledLine> {
+        self.inner
+            .lock()
+            .unwrap()
+            .disassemble(address, count)
+            .into_iter()
+            .map(convert_disassembled_line)
+            .collect()
     }
 }
 
@@ -210,5 +483,147 @@ mod tests {
         emulator.feed_key(0x1E, b'a');
         assert_eq!(emulator.step(), StepResult::Continued);
         assert_eq!(emulator.registers().ax, 0x1E61);
+    }
+
+    #[test]
+    fn tokenize_source_classifies_registers_and_numbers() {
+        let tokens = tokenize_source("MOV AX, 5".to_string());
+        let kinds: Vec<TokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Register,
+                TokenKind::Punctuation,
+                TokenKind::Number
+            ]
+        );
+        assert_eq!(tokens[1].text, "AX");
+    }
+
+    #[test]
+    fn assemble_and_load_exposes_the_line_to_address_map() {
+        let emulator = Emulator::new();
+        let result = emulator.assemble_and_load("MOV AX, 5\nHLT\n".to_string());
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(result.line_to_address.contains(&LineAddress {
+            line: 1,
+            address: 0
+        }));
+        assert!(result.line_to_address.contains(&LineAddress {
+            line: 2,
+            address: 3
+        })); // MOV AX,5 is 3 bytes
+    }
+
+    #[test]
+    fn run_executes_to_completion_and_step_back_undoes_the_last_step() {
+        let emulator = Emulator::new();
+        let result = emulator.assemble_and_load("MOV AX, 1\nMOV BX, 2\nHLT\n".to_string());
+        assert!(
+            result.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+
+        assert_eq!(emulator.run(1_000), RunResult::Halted);
+        assert_eq!(emulator.registers().bx, 2);
+
+        assert!(emulator.can_step_back());
+        assert!(emulator.step_back());
+        assert!(!emulator.halted(), "stepping back over HLT must un-halt");
+    }
+
+    #[test]
+    fn run_stops_at_a_breakpoint_and_run_to_cursor_reaches_the_target() {
+        let emulator = Emulator::new();
+        let result = emulator.assemble_and_load("MOV AX, 1\nMOV BX, 2\nHLT\n".to_string());
+        assert!(result.diagnostics.is_empty());
+        // MOV BX, 2 sits at address 3 (MOV AX,1 is 3 bytes).
+        assert!(emulator.toggle_breakpoint(3));
+        assert!(emulator.is_breakpoint_set(3));
+
+        assert_eq!(emulator.run(1_000), RunResult::BreakpointHit);
+        assert_eq!(emulator.registers().ip, 3);
+        assert_eq!(emulator.registers().bx, 0, "must stop before MOV BX,2 runs");
+
+        emulator.clear_breakpoints();
+        assert!(!emulator.is_breakpoint_set(3));
+        assert_eq!(emulator.run_to_cursor(6, 1_000), RunResult::BreakpointHit);
+        assert_eq!(emulator.registers().ip, 6);
+    }
+
+    #[test]
+    fn set_registers_and_memory_read_write_round_trip_through_the_ffi_surface() {
+        let emulator = Emulator::new();
+        let mut regs = emulator.registers();
+        regs.ax = 0xBEEF;
+        emulator.set_registers(regs);
+        assert_eq!(emulator.registers().ax, 0xBEEF);
+
+        emulator.write_memory_byte(0x10, 0x42);
+        assert_eq!(emulator.read_memory(0x10, 2), vec![0x42, 0x00]);
+    }
+
+    #[test]
+    fn watches_and_variables_are_exposed_over_ffi() {
+        let emulator = Emulator::new();
+        let result = emulator.assemble_and_load("count DW 42\nHLT\n".to_string());
+        assert!(result.diagnostics.is_empty());
+
+        let vars = emulator.variables();
+        assert_eq!(
+            vars,
+            vec![VariableValue {
+                name: "count".to_string(),
+                address: 0,
+                value: 42,
+                is_word: true
+            }]
+        );
+
+        assert_eq!(emulator.add_watch("count".to_string()), None);
+        assert_eq!(
+            emulator.add_watch("nonexistent".to_string()),
+            Some("unrecognized watch expression 'nonexistent'".to_string())
+        );
+        assert_eq!(
+            emulator.watch_values(),
+            vec![WatchValue {
+                expression: "count".to_string(),
+                value: Some(42)
+            }]
+        );
+
+        emulator.remove_watch(0);
+        assert!(emulator.watch_values().is_empty());
+    }
+
+    #[test]
+    fn disassemble_is_exposed_over_ffi() {
+        let emulator = Emulator::new();
+        let result = emulator.assemble_and_load("MOV AX, 1\nHLT\n".to_string());
+        assert!(result.diagnostics.is_empty());
+
+        let lines = emulator.disassemble(0, 2);
+        assert_eq!(
+            lines,
+            vec![
+                DisassembledLine {
+                    address: 0,
+                    text: "MOV AX, 1".to_string(),
+                    byte_len: 3
+                },
+                DisassembledLine {
+                    address: 3,
+                    text: "HLT".to_string(),
+                    byte_len: 1
+                },
+            ]
+        );
     }
 }

@@ -26,17 +26,30 @@ use crate::statement_parser::parse_program;
 use crate::{AssembleResult, Diagnostic, Severity, SymbolTableEntry};
 use x8086_isa::{Instruction, Mnemonic, Operand, Width};
 
+/// A resolved symbol's role, also surfaced on `SymbolTableEntry` for a
+/// Variables/Watch panel: `DataByte`/`DataWord` tell the panel how many
+/// bytes to read back from memory at the symbol's address, while
+/// `Constant`/`Label` are plain numeric values with no memory behind them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SymbolKind {
+pub enum SymbolKind {
     /// Defined via `EQU` - a compile-time constant, never a memory
     /// reference even when used bare.
     Constant,
     /// A code label (`name:`) or `PROC` name - used as a branch target,
     /// or as a raw address value if used bare in a non-branch context.
     Label,
-    /// A `DB`/`DW` variable name - a bare reference to it means "the
-    /// value stored at this address", matching MASM/emu8086 convention.
-    Data,
+    /// A `DB` variable name - a bare reference means "the byte stored at
+    /// this address", matching MASM/emu8086 convention.
+    DataByte,
+    /// A `DW` variable name - same convention as `DataByte`, but the
+    /// bare reference is a 2-byte value.
+    DataWord,
+}
+
+impl SymbolKind {
+    fn is_data(self) -> bool {
+        matches!(self, SymbolKind::DataByte | SymbolKind::DataWord)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +91,7 @@ pub fn assemble(source: &str) -> AssembleResult {
         .map(|(name, entry)| SymbolTableEntry {
             name,
             value: entry.value,
+            kind: entry.kind,
         })
         .collect();
     symbol_entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -99,7 +113,8 @@ fn prescan_symbol_kinds(statements: &[Statement]) -> BTreeMap<String, SymbolKind
     for (i, stmt) in statements.iter().enumerate() {
         if let StatementKind::Label(name) = &stmt.kind {
             let kind = match statements.get(i + 1).map(|s| &s.kind) {
-                Some(StatementKind::Db(_)) | Some(StatementKind::Dw(_)) => SymbolKind::Data,
+                Some(StatementKind::Db(_)) => SymbolKind::DataByte,
+                Some(StatementKind::Dw(_)) => SymbolKind::DataWord,
                 _ => SymbolKind::Label,
             };
             kinds.insert(name.clone(), kind);
@@ -123,7 +138,8 @@ fn pass_one(
         match &stmt.kind {
             StatementKind::Label(name) => {
                 let kind = match statements.get(i + 1).map(|s| &s.kind) {
-                    Some(StatementKind::Db(_)) | Some(StatementKind::Dw(_)) => SymbolKind::Data,
+                    Some(StatementKind::Db(_)) => SymbolKind::DataByte,
+                    Some(StatementKind::Dw(_)) => SymbolKind::DataWord,
                     _ => SymbolKind::Label,
                 };
                 symbols.insert(
@@ -491,12 +507,8 @@ fn resolve_operand(
         ParsedOperand::Reg16(r) => Ok(Operand::Reg16(*r)),
         ParsedOperand::Reg8(r) => Ok(Operand::Reg8(*r)),
         ParsedOperand::Immediate(ParsedExpr::Symbol(name)) => match symbols.get(name) {
-            Some(entry) => match entry.kind {
-                SymbolKind::Data => Ok(Operand::mem_direct(entry.value as i32)),
-                SymbolKind::Constant | SymbolKind::Label => {
-                    Ok(Operand::Immediate(entry.value as i32))
-                }
-            },
+            Some(entry) if entry.kind.is_data() => Ok(Operand::mem_direct(entry.value as i32)),
+            Some(entry) => Ok(Operand::Immediate(entry.value as i32)),
             None if strict => Err(format!("undefined symbol '{name}'")),
             // Forward reference during pass 1: the value is genuinely
             // unknown (0 placeholder), but the operand *shape* must
@@ -504,7 +516,7 @@ fn resolve_operand(
             // pre-scanned kind (see `prescan_symbol_kinds`) is what
             // makes that possible before the symbol is actually defined.
             None => match symbol_kinds.get(name) {
-                Some(SymbolKind::Data) => Ok(Operand::mem_direct(0)),
+                Some(kind) if kind.is_data() => Ok(Operand::mem_direct(0)),
                 _ => Ok(Operand::Immediate(0)),
             },
         },
