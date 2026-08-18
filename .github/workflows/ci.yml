@@ -145,7 +145,29 @@ jobs:
         with:
           files: build/release-unsigned/OpCode-*.dmg
 
-  # Job 6: codesign, notarize, and package a .dmg, then attach it to a
+  # Job 6: a plain secret check has to live in its own job. The `secrets`
+  # context isn't readable from a job-level `if:` at all (GitHub rejects it
+  # with "Unrecognized named-value: 'secrets'") - it's only readable inside
+  # a step, or downstream via `needs.<job>.outputs`. So this job reads the
+  # secret in a step and republishes it as a boolean output for job 7 to
+  # gate on.
+  check-release-secrets:
+    name: Check for Developer ID secrets
+    runs-on: ubuntu-latest
+    outputs:
+      has-secrets: ${{ steps.check.outputs.has-secrets }}
+    steps:
+      - id: check
+        env:
+          DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+        run: |
+          if [ -n "$DEVELOPER_ID_CERTIFICATE_P12" ]; then
+            echo "has-secrets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-secrets=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Job 7: codesign, notarize, and package a .dmg, then attach it to a
   # GitHub Release - the properly signed replacement for job 5's output,
   # once Developer ID enrollment happens. Skips cleanly (not a failure)
   # until then, gated on whether the first secret it needs is set.
@@ -170,8 +192,8 @@ jobs:
   release:
     name: Release (sign, notarize, package .dmg)
     runs-on: macos-latest
-    needs: [rust-checks, xcode-unit-tests, xcode-e2e-tests]
-    if: startsWith(github.ref, 'refs/tags/v') && secrets.DEVELOPER_ID_CERTIFICATE_P12 != ''
+    needs: [rust-checks, xcode-unit-tests, xcode-e2e-tests, check-release-secrets]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.check-release-secrets.outputs.has-secrets == 'true'
     steps:
       - uses: actions/checkout@v4
 
