@@ -1,11 +1,14 @@
-//! End-to-end regression tests built from two real-world `.asm` programs
-//! a user reported as failing to assemble/run: one written in classic
+//! End-to-end regression tests built from real-world `.asm` programs
+//! users reported as failing to assemble/run: two written in classic
 //! emu8086/MASM style (`.MODEL`/`.STACK`/`.DATA`/`.CODE`, `OFFSET`, shift/
-//! rotate instructions), the other in NASM style (`section .text`/
+//! rotate instructions), one in NASM style (`section .text`/
 //! `section .data`, `$`, bare `WORD [...]` without `PTR`, `DIV`/`IMUL`,
-//! string instructions with `REP`/`REPE`). Both are self-checking: they
-//! print "...: PASS$" and exit via `INT 21h AH=4Ch` with AL=0 on success,
-//! or print "...: FAIL$" and exit with AL=1 the moment any check fails.
+//! string instructions with `REP`/`REPE`). The first two are
+//! self-checking: they print "...: PASS$" and exit via `INT 21h AH=4Ch`
+//! with AL=0 on success, or print "...: FAIL$" and exit with AL=1 the
+//! moment any check fails. The buffered-input one is a real lab
+//! assignment with no such self-check - it's verified by asserting the
+//! exact console transcript instead.
 
 use x8086_emulator::{Emulator, StepOutcome};
 
@@ -216,6 +219,205 @@ errmsg  db  \"8086 emulator test: FAIL$\"
 iarray  dw  10, 20, 30, 40, 50
 dst     times 32 db 0
 ";
+
+/// Reported as failing with "unexpected token '[' after operand" on
+/// every line using `buff1[1]`/`buff1[2]` (MASM's `symbol[expr]`
+/// indexing sugar for `[symbol+expr]`), and separately - once that parse
+/// error was fixed - would have gone on to read garbage input, since
+/// `INT 21h AH=0Ah` (buffered line input) wasn't simulated at all. Kept
+/// byte-for-byte as originally reported, including the `MODEL SMALL`
+/// capitalization and the mixed-case `H`-suffix hex literals.
+const BUFFERED_MULTIPLY_PROGRAM: &str = "\
+.MODEL SMALL
+.STACK 100H
+
+.DATA
+    msg1    DB \"Enter Multiplier: $\"
+    msg2    DB 0DH,0AH,\"Enter Multiplicand: $\"
+    msg3    DB 0DH,0AH,\"Product = $\"
+    crlf    DB 0DH,0AH,\"$\"
+
+    buff1   DB 7,0,7 DUP('$')
+    buff2   DB 7,0,7 DUP('$')
+
+    num1    DW 0
+    num2    DW 0
+
+.CODE
+MAIN PROC
+    MOV AX, @DATA
+    MOV DS, AX
+
+    LEA DX, msg1
+    MOV AH, 09H
+    INT 21H
+
+    LEA DX, buff1
+    MOV AH, 0AH
+    INT 21H
+
+    MOV CL, buff1[1]
+    XOR CH, CH
+    LEA SI, buff1[2]
+    CALL STR_TO_NUM
+    MOV num1, BX
+
+    LEA DX, msg2
+    MOV AH, 09H
+    INT 21H
+
+    LEA DX, buff2
+    MOV AH, 0AH
+    INT 21H
+
+    MOV CL, buff2[1]
+    XOR CH, CH
+    LEA SI, buff2[2]
+    CALL STR_TO_NUM
+    MOV num2, BX
+
+    MOV AX, num1
+    MOV CX, num2
+    MUL CX
+
+    LEA DX, msg3
+    MOV AH, 09H
+    INT 21H
+
+    CALL PRINT_NUM
+
+    LEA DX, crlf
+    MOV AH, 09H
+    INT 21H
+
+    MOV AH, 4CH
+    INT 21H
+MAIN ENDP
+
+STR_TO_NUM PROC
+    PUSH AX
+    PUSH DX
+    XOR BX, BX
+S2N_LOOP:
+    MOV AL, [SI]
+    SUB AL, '0'
+    XOR AH, AH
+    PUSH AX
+    MOV AX, BX
+    MOV DX, 10
+    MUL DX
+    MOV BX, AX
+    POP AX
+    ADD BX, AX
+    INC SI
+    LOOP S2N_LOOP
+    POP DX
+    POP AX
+    RET
+STR_TO_NUM ENDP
+
+PRINT_NUM PROC
+    PUSH AX
+    PUSH BX
+    PUSH CX
+    PUSH DX
+
+    MOV CX, 0
+    MOV BX, 10
+
+    CMP AX, 0
+    JNE PN_LOOP
+    MOV DL, '0'
+    MOV AH, 02H
+    INT 21H
+    JMP PN_DONE
+
+PN_LOOP:
+    CMP AX, 0
+    JE PN_PRINT
+    XOR DX, DX
+    DIV BX
+    PUSH DX
+    INC CX
+    JMP PN_LOOP
+
+PN_PRINT:
+    CMP CX, 0
+    JE PN_DONE
+    POP DX
+    ADD DL, '0'
+    MOV AH, 02H
+    INT 21H
+    DEC CX
+    JMP PN_PRINT
+
+PN_DONE:
+    POP DX
+    POP CX
+    POP BX
+    POP AX
+    RET
+PRINT_NUM ENDP
+
+END MAIN
+";
+
+/// Like `run_to_completion`, but feeds `keys` (one ASCII byte per
+/// keystroke) to satisfy each `WaitingForKeyboard` pause in turn - for
+/// programs that actually read from the console, as opposed to the
+/// self-checking programs above which do no I/O at all.
+fn run_to_completion_with_keyboard_input(source: &str, keys: &[u8]) -> String {
+    let mut emulator = Emulator::new();
+    let result = emulator.assemble_and_load(source);
+    assert!(
+        result.diagnostics.is_empty(),
+        "unexpected diagnostics: {:?}",
+        result.diagnostics
+    );
+
+    let mut keys = keys.iter().copied();
+    const MAX_STEPS: usize = 200_000;
+    let mut steps = 0;
+    loop {
+        match emulator.step().expect("program must decode cleanly") {
+            StepOutcome::Halted => break,
+            StepOutcome::Continued => {}
+            StepOutcome::WaitingForKeyboard => {
+                let ascii = keys
+                    .next()
+                    .expect("program asked for more keyboard input than the test supplied");
+                emulator.feed_key(0, ascii);
+            }
+        }
+        steps += 1;
+        assert!(
+            steps < MAX_STEPS,
+            "program did not halt within {MAX_STEPS} steps - likely an infinite-loop bug"
+        );
+    }
+
+    emulator.console_output().to_string()
+}
+
+#[test]
+fn buffered_input_multiply_program_reads_two_numbers_and_prints_their_product() {
+    // "12" <Enter> "34" <Enter>. 12 * 34 = 408 (AX = 0x0198 right after
+    // `MUL CX`) - but the source's own `MOV AH, 09H` (to select the
+    // "print string" DOS function for the "Product = " message) clobbers
+    // just the *high* byte of AX before `CALL PRINT_NUM` ever reads it,
+    // turning 0x0198 into 0x0998 = 2456. That's a bug in the reported
+    // program itself (PRINT_NUM's own comment - "prints value currently
+    // in AX" - is simply wrong given what runs between `MUL` and the
+    // call), not in assembly or emulation: real DOS/emu8086 would print
+    // the exact same wrong "2456" from this exact source. Asserting the
+    // literal (buggy) output, not the mathematically "expected" one, is
+    // what actually proves the emulation is faithful here.
+    let console = run_to_completion_with_keyboard_input(BUFFERED_MULTIPLY_PROGRAM, b"12\r34\r");
+    assert_eq!(
+        console,
+        "Enter Multiplier: 12\r\n\r\nEnter Multiplicand: 34\r\n\r\nProduct = 2456\r\n"
+    );
+}
 
 /// Runs `source` to completion (HLT or an `INT 21h AH=4Ch` termination),
 /// asserting it assembled with zero diagnostics and returning the final

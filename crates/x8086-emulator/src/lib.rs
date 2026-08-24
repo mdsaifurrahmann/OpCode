@@ -317,7 +317,7 @@ impl Emulator {
 
         if let Some(vector) = self.pending_interrupt {
             let registers_before = self.registers;
-            let outcome = self.try_complete_interrupt(vector);
+            let outcome = self.try_complete_interrupt(vector, false);
             let memory_diffs = self.drain_memory_diffs();
             // Still waiting means nothing actually happened yet - no step
             // to undo, and pushing a no-op entry would let step_back
@@ -351,7 +351,7 @@ impl Emulator {
                 StepOutcome::Halted
             }
             ExecutionEffect::Continue => StepOutcome::Continued,
-            ExecutionEffect::Interrupt(vector) => self.try_complete_interrupt(vector),
+            ExecutionEffect::Interrupt(vector) => self.try_complete_interrupt(vector, true),
         };
         let memory_diffs = self.drain_memory_diffs();
         if outcome != StepOutcome::WaitingForKeyboard {
@@ -364,8 +364,19 @@ impl Emulator {
         Ok(outcome)
     }
 
-    fn try_complete_interrupt(&mut self, vector: u8) -> StepOutcome {
-        match handle_interrupt(vector, &mut self.registers, &self.memory, &mut self.console) {
+    /// `first_attempt` is `true` only when this interrupt was just
+    /// reached by normal execution (from `ExecutionEffect::Interrupt`
+    /// above), `false` when `step` is retrying an interrupt still
+    /// pending from a previous call - see `handle_interrupt`'s docs for
+    /// why AH=0Ah specifically needs to tell those apart.
+    fn try_complete_interrupt(&mut self, vector: u8, first_attempt: bool) -> StepOutcome {
+        match handle_interrupt(
+            vector,
+            &mut self.registers,
+            &mut self.memory,
+            &mut self.console,
+            first_attempt,
+        ) {
             InterruptOutcome::Continue => {
                 self.pending_interrupt = None;
                 StepOutcome::Continued
