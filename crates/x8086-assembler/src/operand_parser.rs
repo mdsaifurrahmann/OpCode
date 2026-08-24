@@ -5,7 +5,7 @@ use crate::ast::{ParsedExpr, ParsedOperand};
 use crate::expr_parser::parse_expr_chain;
 use crate::numbers::parse_number;
 use crate::parse_error::ParseError;
-use crate::{Token, TokenKind};
+use crate::{Span, Token, TokenKind};
 use x8086_isa::{Reg16, Reg8, Width};
 
 fn register_operand_from_name(name: &str) -> Option<ParsedOperand> {
@@ -116,17 +116,7 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
         .clone();
 
     if is_punct(&tok, "[") {
-        *pos += 1;
-        let (base, index, displacement) = parse_memory_expr(tokens, pos)?;
-        let close = peek(tokens, *pos)
-            .ok_or_else(|| ParseError::new(tok.span, "unterminated memory operand: missing ']'"))?;
-        if !is_punct(close, "]") {
-            return Err(ParseError::new(
-                close.span,
-                format!("expected ']', found '{}'", close.text),
-            ));
-        }
-        *pos += 1;
+        let (base, index, displacement) = parse_bracket_addressing(tokens, pos)?;
         return Ok(ParsedOperand::Memory {
             size_override,
             segment_override,
@@ -153,11 +143,65 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
         let operand = register_operand_from_name(&tok.text)
             .ok_or_else(|| ParseError::new(tok.span, format!("unknown register '{}'", tok.text)))?;
         *pos += 1;
+
+        // MASM/emu8086's `reg[expr]` indexing operator: sugar for
+        // `[reg+expr]` (`bx[2]`, `si[di]`) - see the identical handling
+        // below for the symbol/number case, which this mirrors.
+        if peek(tokens, *pos).is_some_and(|t| is_punct(t, "[")) {
+            let reg = addressing_reg16_from_name(&tok.text).ok_or_else(|| {
+                ParseError::new(
+                    tok.span,
+                    format!(
+                        "'{}' cannot be used as a base/index register inside [...]",
+                        tok.text
+                    ),
+                )
+            })?;
+            let bracket_span = tokens[*pos].span;
+            let (bracket_base, bracket_index, displacement) =
+                parse_bracket_addressing(tokens, pos)?;
+            let mut base = Some(reg);
+            let mut index = None;
+            if let Some(b) = bracket_base {
+                assign_addressing_reg(&mut base, &mut index, b, bracket_span)?;
+            }
+            if let Some(ix) = bracket_index {
+                assign_addressing_reg(&mut base, &mut index, ix, bracket_span)?;
+            }
+            return Ok(ParsedOperand::Memory {
+                size_override,
+                segment_override,
+                base,
+                index,
+                displacement,
+            });
+        }
+
         return Ok(operand);
     }
 
     if matches!(tok.kind, TokenKind::Number | TokenKind::Identifier) || is_punct(&tok, "$") {
         let expr = parse_expr_chain(tokens, pos)?;
+
+        // MASM/emu8086's `symbol[expr]` indexing operator: pure sugar for
+        // `[symbol+expr]` (`buff1[1]`, `table[SI]`, `array[BX+2]`). Only
+        // recognized here, not inside expr_parser, since it produces a
+        // memory operand shape, not an arithmetic value.
+        if peek(tokens, *pos).is_some_and(|t| is_punct(t, "[")) {
+            let (base, index, bracket_displacement) = parse_bracket_addressing(tokens, pos)?;
+            let displacement = Some(match bracket_displacement {
+                Some(d) => ParsedExpr::accumulate(Some(expr), d),
+                None => expr,
+            });
+            return Ok(ParsedOperand::Memory {
+                size_override,
+                segment_override,
+                base,
+                index,
+                displacement,
+            });
+        }
+
         return Ok(ParsedOperand::Immediate(expr));
     }
 
@@ -261,6 +305,54 @@ fn parse_memory_term(
 /// A memory operand's addressing components: base register, index
 /// register, and displacement expression (all optional).
 type MemoryAddressing = (Option<Reg16>, Option<Reg16>, Option<ParsedExpr>);
+
+/// Parses a `[...]` group and returns its addressing components. Assumes
+/// the caller already confirmed `tokens[*pos]` is `[` (both call sites -
+/// the plain `[...]` operand and the `reg[...]`/`symbol[...]` postfix
+/// forms - check that before calling, so a missing `[` here would be a
+/// caller bug, not a user-facing parse error).
+fn parse_bracket_addressing(
+    tokens: &[Token],
+    pos: &mut usize,
+) -> Result<MemoryAddressing, ParseError> {
+    let open_span = tokens[*pos].span;
+    *pos += 1;
+    let (base, index, displacement) = parse_memory_expr(tokens, pos)?;
+    let close = peek(tokens, *pos)
+        .ok_or_else(|| ParseError::new(open_span, "unterminated memory operand: missing ']'"))?;
+    if !is_punct(close, "]") {
+        return Err(ParseError::new(
+            close.span,
+            format!("expected ']', found '{}'", close.text),
+        ));
+    }
+    *pos += 1;
+    Ok((base, index, displacement))
+}
+
+/// Fills `reg` into `base` if it's free, else `index`, else errors - the
+/// same "at most two registers" rule `parse_memory_expr`'s own `apply`
+/// closure enforces within a single `[...]`, reused here to merge a
+/// register that came from *outside* the brackets (the `reg` in
+/// `reg[...]`) with whatever the brackets themselves contributed.
+fn assign_addressing_reg(
+    base: &mut Option<Reg16>,
+    index: &mut Option<Reg16>,
+    reg: Reg16,
+    span: Span,
+) -> Result<(), ParseError> {
+    if base.is_none() {
+        *base = Some(reg);
+    } else if index.is_none() {
+        *index = Some(reg);
+    } else {
+        return Err(ParseError::new(
+            span,
+            "a memory operand allows at most two registers (base + index)",
+        ));
+    }
+    Ok(())
+}
 
 fn parse_memory_expr(tokens: &[Token], pos: &mut usize) -> Result<MemoryAddressing, ParseError> {
     let mut base = None;
@@ -559,5 +651,44 @@ mod tests {
             parse_operand(&tokens, &mut pos).is_err(),
             "'[BX SI]' without a '+' must not silently parse as [BX+SI]"
         );
+    }
+
+    #[test]
+    fn symbol_bracket_indexing_is_sugar_for_symbol_plus_displacement() {
+        // The exact shape that used to fail with "unexpected token '['
+        // after operand" - MASM/emu8086's `buff1[1]` reads as `[buff1+1]`.
+        assert_eq!(operand_of("buff1[1]"), operand_of("[buff1+1]"));
+    }
+
+    #[test]
+    fn symbol_bracket_indexing_with_a_register_inside() {
+        // `table[SI]` == `[table+SI]` - the classic array-indexing idiom.
+        assert_eq!(operand_of("table[SI]"), operand_of("[table+SI]"));
+    }
+
+    #[test]
+    fn register_bracket_indexing_is_sugar_for_register_plus_displacement() {
+        assert_eq!(operand_of("BX[2]"), operand_of("[BX+2]"));
+    }
+
+    #[test]
+    fn register_bracket_indexing_with_a_second_register_inside() {
+        assert_eq!(operand_of("BX[SI]"), operand_of("[BX+SI]"));
+    }
+
+    #[test]
+    fn rejects_bracket_indexing_off_a_non_addressing_register() {
+        // AX can't be a base/index register, with or without the [...]
+        // sugar - the same restriction `[AX]` already has.
+        let tokens = tokenize("AX[2]");
+        let mut pos = 0;
+        assert!(parse_operand(&tokens, &mut pos).is_err());
+    }
+
+    #[test]
+    fn bracket_indexing_still_rejects_a_third_register() {
+        let tokens = tokenize("BX[SI+DI]");
+        let mut pos = 0;
+        assert!(parse_operand(&tokens, &mut pos).is_err());
     }
 }
