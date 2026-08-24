@@ -419,6 +419,107 @@ fn buffered_input_multiply_program_reads_two_numbers_and_prints_their_product() 
     );
 }
 
+/// A second reported program with the *same* underlying defect as
+/// `BUFFERED_MULTIPLY_PROGRAM`, reduced to single-digit input, reported
+/// as "the emulator computes 2*3 wrong". `{FIX}` is substituted to
+/// produce two variants from one source, so the only difference between
+/// the broken and working runs is provably the fix itself.
+const SINGLE_DIGIT_MULTIPLY_PROGRAM: &str = "\
+.MODEL SMALL
+.STACK 100H
+
+.DATA
+    msg1 DB \"Enter 1st number: $\"
+    msg2 DB 0DH,0AH,\"Enter 2nd number: $\"
+    msg3 DB 0DH,0AH,\"Product = $\"
+
+.CODE
+MAIN PROC
+    MOV AX, @DATA
+    MOV DS, AX
+
+    LEA DX, msg1
+    MOV AH, 09H
+    INT 21H
+    MOV AH, 01H
+    INT 21H
+    SUB AL, '0'
+    MOV BL, AL
+
+    LEA DX, msg2
+    MOV AH, 09H
+    INT 21H
+    MOV AH, 01H
+    INT 21H
+    SUB AL, '0'
+    MOV CL, AL
+
+    MOV AL, BL
+    MUL CL
+
+    LEA DX, msg3
+    MOV AH, 09H
+    INT 21H
+{FIX}
+    MOV BL, 10
+    DIV BL
+    MOV CL, AH
+
+    CMP AL, 0
+    JE ONES
+    ADD AL, '0'
+    MOV DL, AL
+    MOV AH, 02H
+    INT 21H
+ONES:
+    MOV DL, CL
+    ADD DL, '0'
+    MOV AH, 02H
+    INT 21H
+
+    MOV AH, 4CH
+    INT 21H
+MAIN ENDP
+END MAIN
+";
+
+#[test]
+fn single_digit_multiply_reproduces_the_reported_garbled_output_as_written() {
+    // 2 * 3. `MUL CL` correctly leaves AX = 6, but the program's own
+    // `MOV AH, 09H` (selecting the DOS print-string function for the
+    // "Product = " label) rewrites the *high half of AX* before `DIV BL`
+    // consumes it - so DIV divides 0x0906 = 2310, not 6, yielding
+    // AL = 231. `ADD AL, '0'` then overflows 8 bits (231 + 48 = 279)
+    // and wraps to 0x17, an unprintable control character.
+    //
+    // Every step of that is documented 8086 behavior - see
+    // x8086-cpu's `mov_ah_between_mul_and_div_corrupts_the_product_
+    // exactly_as_real_hardware_does`, which asserts each instruction
+    // individually, and the iced-x86 cross-validation confirming the
+    // encodings. Real DOS/emu8086 print the same garbage from this
+    // source. Pinning the literal broken output is what proves the
+    // emulation stays faithful rather than silently "helpfully" wrong.
+    let source = SINGLE_DIGIT_MULTIPLY_PROGRAM.replace("{FIX}", "");
+    let console = run_to_completion_with_keyboard_input(&source, b"23");
+    assert_eq!(
+        console,
+        "Enter 1st number: 2\r\nEnter 2nd number: 3\r\nProduct = \u{17}0"
+    );
+}
+
+#[test]
+fn single_digit_multiply_prints_6_once_the_product_is_preserved_across_the_dos_call() {
+    // The one-line fix: stash the product before the DOS call clobbers
+    // AH, restore it right before DIV. Same program otherwise.
+    let source = SINGLE_DIGIT_MULTIPLY_PROGRAM.replace("{FIX}", "    MOV AL, BL\n    MUL CL\n");
+    let console = run_to_completion_with_keyboard_input(&source, b"23");
+    assert_eq!(
+        console, "Enter 1st number: 2\r\nEnter 2nd number: 3\r\nProduct = 6",
+        "with AX intact, DIV BL sees 6: AL=0 (tens, skipped by the \
+         CMP/JE) and AH=6 (ones), printing exactly \"6\""
+    );
+}
+
 /// Runs `source` to completion (HLT or an `INT 21h AH=4Ch` termination),
 /// asserting it assembled with zero diagnostics and returning the final
 /// AL value (the program's own self-reported exit code: 0 = pass, 1 =

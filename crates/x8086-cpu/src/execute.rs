@@ -674,6 +674,143 @@ mod tests {
         Instruction::new(mnemonic, operands, width, 0)
     }
 
+    /// The precise sequence a reported "the emulator computes 2*3 wrong"
+    /// case hinges on. Nothing here is emulator-specific - each assertion
+    /// is a direct statement of documented 8086 semantics, isolated so
+    /// the claim can be checked one instruction at a time rather than
+    /// argued about at the whole-program level:
+    ///
+    ///   MUL CL      ; AX <- AL * CL          (AX is the *full* 16-bit
+    ///                                         product, AH included)
+    ///   MOV AH, 09h ; AH is the high half of AX, so this rewrites the
+    ///                 product's high byte - AX is no longer the product
+    ///   DIV BL      ; AL <- AX / BL, AH <- AX % BL, using that *modified*
+    ///                 AX, not the original product
+    ///
+    /// If a program computes a product with MUL and then selects a DOS
+    /// function with `MOV AH, ...` before consuming it, the value DIV
+    /// later divides is the corrupted one. That is correct hardware
+    /// behavior, not a defect.
+    #[test]
+    fn mov_ah_between_mul_and_div_corrupts_the_product_exactly_as_real_hardware_does() {
+        let mut regs = Registers::new();
+        let mut memory = Memory::new();
+
+        // MOV AL, 2 / MOV CL, 3 / MUL CL  ->  AX = 6
+        regs.set8(Reg8::Al, 2);
+        regs.set8(Reg8::Cl, 3);
+        execute(
+            &instr(
+                Mnemonic::Mul,
+                vec![Operand::Reg8(Reg8::Cl)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.ax, 0x0006, "MUL CL must put the full product in AX");
+
+        // MOV AH, 09h - selects the DOS "print string" function, and in
+        // doing so overwrites the product's high byte.
+        execute(
+            &instr(
+                Mnemonic::Mov,
+                vec![Operand::Reg8(Reg8::Ah), Operand::Immediate(0x09)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(
+            regs.ax, 0x0906,
+            "AH is the high half of AX: writing it must leave AL alone and \
+             change AX from 6 to 0x0906 (2310)"
+        );
+
+        // MOV BL, 10 / DIV BL - divides 2310, not 6.
+        regs.set8(Reg8::Bl, 10);
+        execute(
+            &instr(
+                Mnemonic::Div,
+                vec![Operand::Reg8(Reg8::Bl)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(
+            regs.get8(Reg8::Al),
+            231,
+            "2310 / 10 = 231 - the quotient of the corrupted AX"
+        );
+        assert_eq!(regs.get8(Reg8::Ah), 0, "2310 % 10 = 0");
+
+        // ADD AL, '0' then wraps: 231 + 48 = 279, truncated to 8 bits.
+        execute(
+            &instr(
+                Mnemonic::Add,
+                vec![Operand::Reg8(Reg8::Al), Operand::Immediate(b'0' as i32)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(
+            regs.get8(Reg8::Al),
+            0x17,
+            "279 doesn't fit in 8 bits - it wraps to 0x17, an unprintable \
+             control character, which is what actually reaches the console"
+        );
+    }
+
+    /// The same sequence with the single fix applied (preserve AX across
+    /// the DOS call), proving the emulator produces the expected 6 the
+    /// moment the program stops clobbering its own result.
+    #[test]
+    fn preserving_ax_across_the_dos_call_yields_the_expected_product() {
+        let mut regs = Registers::new();
+        let mut memory = Memory::new();
+        regs.set8(Reg8::Al, 2);
+        regs.set8(Reg8::Cl, 3);
+        execute(
+            &instr(
+                Mnemonic::Mul,
+                vec![Operand::Reg8(Reg8::Cl)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        let product = regs.ax;
+
+        // ... MOV AH, 09h / INT 21h happens here, clobbering AH ...
+        execute(
+            &instr(
+                Mnemonic::Mov,
+                vec![Operand::Reg8(Reg8::Ah), Operand::Immediate(0x09)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        // ... but the program restored AX first (PUSH AX / POP AX, or via
+        // a memory variable), so DIV sees the real product again.
+        regs.ax = product;
+
+        regs.set8(Reg8::Bl, 10);
+        execute(
+            &instr(
+                Mnemonic::Div,
+                vec![Operand::Reg8(Reg8::Bl)],
+                Some(Width::Byte),
+            ),
+            &mut regs,
+            &mut memory,
+        );
+        assert_eq!(regs.get8(Reg8::Al), 0, "tens digit of 6");
+        assert_eq!(regs.get8(Reg8::Ah), 6, "ones digit of 6");
+    }
+
     #[test]
     fn mov_copies_immediate_into_register() {
         let mut regs = Registers::new();
