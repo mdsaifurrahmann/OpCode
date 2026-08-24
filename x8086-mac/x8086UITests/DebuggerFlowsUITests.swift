@@ -131,4 +131,57 @@ final class DebuggerFlowsUITests: XCTestCase {
             "must stop before MOV CX,3 runs"
         )
     }
+
+    /// Run to Here needs *two* things - a loaded, stopped program and a
+    /// selected Disassembly line - and users reasonably read the second,
+    /// invisible one as the button being broken. Pinning each transition
+    /// keeps the rule documented, and would catch a regression that left
+    /// the button dead even once both conditions are genuinely met.
+    func testRunToHereIsEnabledOnlyOnceAProgramIsStoppedAndALineIsSelected() {
+        let app = XCUIApplication()
+        app.launch()
+
+        let runToHere = app.buttons["runToCursorButton"]
+        XCTAssertTrue(runToHere.waitForExistence(timeout: 5))
+        XCTAssertFalse(
+            runToHere.isEnabled,
+            "nothing is assembled on a fresh launch, so there is no address to run to"
+        )
+
+        typeSource(app, "MOV AX, 1\nMOV BX, 2\nMOV CX, 3\nHLT\n")
+        app.buttons["restartButton"].click()
+        waitForRegister(app, "AX", toEqual: "0000")
+
+        XCTAssertTrue(
+            app.buttons["disasmLine_0"].waitForExistence(timeout: 5),
+            "Restart should have populated the Disassembly panel"
+        )
+        XCTAssertFalse(
+            runToHere.isEnabled,
+            "the program is stopped and disassembly is populated, but no line is selected yet - this is the state users hit and read as 'permanently disabled'"
+        )
+
+        app.buttons["disasmLine_6"].click()
+        let becameEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in runToHere.isEnabled },
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [becameEnabled], timeout: 5), .completed,
+            "selecting a Disassembly line is the missing precondition - the button must enable once it's met"
+        )
+
+        // Running to completion leaves the program halted, which disables
+        // it again: there's nothing left to run to.
+        app.buttons["runButton"].click()
+        XCTAssertTrue(app.staticTexts["haltedLabel"].waitForExistence(timeout: 10))
+        let becameDisabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in !runToHere.isEnabled },
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [becameDisabled], timeout: 5), .completed,
+            "a finished program has nothing left to run to - Restart is required first"
+        )
+    }
 }

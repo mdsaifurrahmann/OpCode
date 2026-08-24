@@ -10,6 +10,30 @@ struct DebuggerToolbar: View {
     let onRunToCursor: () -> Void
     let canRunToCursor: Bool
 
+    /// Run to Here has two preconditions - a loaded, stopped program and
+    /// a selected Disassembly line - and the second one is invisible:
+    /// nothing on screen says a selection is required, so the button
+    /// reads as permanently broken (a normal Run ends `halted`, which
+    /// also disables it). A single static tooltip can only ever describe
+    /// one of those cases, so it names whichever one is actually
+    /// blocking right now.
+    private var runToHereHelp: String {
+        switch controller.executionState {
+        case .notLoaded:
+            return "Load a program first - click Run or Restart, then pick a line in the Disassembly panel to run to."
+        case .running:
+            return "Pause first, then pick a line in the Disassembly panel to run to."
+        case .waitingForKeyboard:
+            return "The program is waiting for a keystroke - type into the Console first."
+        case .halted:
+            return "The program has finished. Click Restart, then pick a line in the Disassembly panel to run to."
+        case .stopped:
+            return canRunToCursor
+                ? "Run straight to the selected Disassembly line - a one-off breakpoint that isn't saved."
+                : "Pick a line in the Disassembly panel first - this then runs straight to it, like a one-off breakpoint that isn't saved."
+        }
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             Button(controller.isRunning ? "Running…" : "Run", action: onRun)
@@ -47,7 +71,7 @@ struct DebuggerToolbar: View {
             Button("Run to Here", action: onRunToCursor)
                 .disabled(!canRunToCursor || !controller.canStep)
                 .accessibilityIdentifier("runToCursorButton")
-                .help("Select a line in the Disassembly panel first, then use this to run straight to it - a one-off breakpoint that isn't saved.")
+                .help(runToHereHelp)
 
             Divider().frame(height: 16)
 
