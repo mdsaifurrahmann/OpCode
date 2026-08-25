@@ -180,7 +180,15 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
         return Ok(operand);
     }
 
-    if matches!(tok.kind, TokenKind::Number | TokenKind::Identifier) || is_punct(&tok, "$") {
+    // A leading `-`/`+` starts a signed immediate (`MOV BX, -10`) - it
+    // has to be routed into the expression parser here, since otherwise
+    // the sign isn't one of the token kinds that looks like the start of
+    // an operand and falls through to the catch-all error below.
+    if matches!(tok.kind, TokenKind::Number | TokenKind::Identifier)
+        || is_punct(&tok, "$")
+        || is_punct(&tok, "-")
+        || is_punct(&tok, "+")
+    {
         let expr = parse_expr_chain(tokens, pos)?;
 
         // MASM/emu8086's `symbol[expr]` indexing operator: pure sugar for
@@ -384,8 +392,19 @@ fn parse_memory_expr(tokens: &[Token], pos: &mut usize) -> Result<MemoryAddressi
         }
     };
 
+    // The first term can carry its own sign (`[-10]`); every later term
+    // gets its sign from the `+`/`-` separator the loop below requires.
+    let mut negate_first = false;
+    while let Some(tok) = peek(tokens, *pos) {
+        if is_punct(tok, "-") {
+            negate_first = !negate_first;
+        } else if !is_punct(tok, "+") {
+            break;
+        }
+        *pos += 1;
+    }
     let first_span = peek(tokens, *pos).map(|t| t.span).unwrap_or_default();
-    let first = parse_memory_term(tokens, pos, false)?;
+    let first = parse_memory_term(tokens, pos, negate_first)?;
     apply(first, &mut base, &mut index, &mut displacement, first_span)?;
 
     loop {
