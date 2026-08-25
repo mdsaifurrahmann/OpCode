@@ -62,6 +62,12 @@ pub fn lookup_mnemonic(text: &str) -> Option<Mnemonic> {
         "STD" => Mnemonic::Std,
         "CLI" => Mnemonic::Cli,
         "STI" => Mnemonic::Sti,
+        "PUSHF" => Mnemonic::Pushf,
+        "POPF" => Mnemonic::Popf,
+        "LAHF" => Mnemonic::Lahf,
+        "SAHF" => Mnemonic::Sahf,
+        // NASM spells the no-operand form XLATB; both assemble to D7.
+        "XLAT" | "XLATB" => Mnemonic::Xlat,
 
         "SHL" | "SAL" => Mnemonic::Shl,
         "SHR" => Mnemonic::Shr,

@@ -59,6 +59,11 @@ pub fn encode_one(instr: &Instruction) -> Result<Vec<u8>, EncodeError> {
         Mnemonic::Std => Ok(vec![0xFD]),
         Mnemonic::Cli => Ok(vec![0xFA]),
         Mnemonic::Sti => Ok(vec![0xFB]),
+        Mnemonic::Pushf => Ok(vec![0x9C]),
+        Mnemonic::Popf => Ok(vec![0x9D]),
+        Mnemonic::Sahf => Ok(vec![0x9E]),
+        Mnemonic::Lahf => Ok(vec![0x9F]),
+        Mnemonic::Xlat => Ok(vec![0xD7]),
         Mnemonic::Shl
         | Mnemonic::Shr
         | Mnemonic::Sar
@@ -1118,6 +1123,11 @@ mod tests {
         assert_round_trips(instr(Mnemonic::Iret, vec![], None));
         assert_round_trips(instr(Mnemonic::Hlt, vec![], None));
         assert_round_trips(instr(Mnemonic::Clc, vec![], None));
+        assert_round_trips(instr(Mnemonic::Pushf, vec![], None));
+        assert_round_trips(instr(Mnemonic::Popf, vec![], None));
+        assert_round_trips(instr(Mnemonic::Lahf, vec![], None));
+        assert_round_trips(instr(Mnemonic::Sahf, vec![], None));
+        assert_round_trips(instr(Mnemonic::Xlat, vec![], None));
     }
 
     #[test]

@@ -22,6 +22,11 @@ pub enum ExecutionEffect {
     Interrupt(u8),
 }
 
+/// The five FLAGS bits LAHF/SAHF transfer through AH: SF (7), ZF (6),
+/// AF (4), PF (2), CF (0). The gaps are the 8086's reserved bits, which
+/// this emulator doesn't model either way.
+const LOW_FLAGS_MASK: u16 = 0b1101_0101;
+
 fn push_word(regs: &mut Registers, memory: &mut Memory, value: u16) {
     regs.sp = regs.sp.wrapping_sub(2);
     let addr = Memory::resolve(regs.ss, regs.sp);
@@ -226,6 +231,26 @@ pub fn execute(instr: &Instruction, regs: &mut Registers, memory: &mut Memory) -
         Mnemonic::Std => regs.set_flag(Flag::Direction, true),
         Mnemonic::Cli => regs.set_flag(Flag::Interrupt, false),
         Mnemonic::Sti => regs.set_flag(Flag::Interrupt, true),
+
+        Mnemonic::Pushf => push_word(regs, memory, regs.flags),
+        Mnemonic::Popf => regs.flags = pop_word(regs, memory),
+        // LAHF/SAHF move only the low byte of FLAGS - SF, ZF, AF, PF,
+        // CF, at bits 7, 6, 4, 2, 0. SAHF masks to exactly those five so
+        // it can't invent values for the bits in between, which this
+        // emulator doesn't model (see `Mnemonic::Pushf`'s docs); LAHF
+        // hands back the low byte as it actually stands, so a
+        // LAHF/SAHF round trip is lossless.
+        Mnemonic::Lahf => regs.set8(Reg8::Ah, regs.flags as u8),
+        Mnemonic::Sahf => {
+            let ah = regs.get8(Reg8::Ah) as u16;
+            regs.flags = (regs.flags & !LOW_FLAGS_MASK) | (ah & LOW_FLAGS_MASK);
+        }
+        // XLAT: AL indexes a byte table based at DS:BX.
+        Mnemonic::Xlat => {
+            let offset = regs.bx.wrapping_add(regs.get8(Reg8::Al) as u16);
+            let value = memory.read_u8(Memory::resolve(regs.ds, offset));
+            regs.set8(Reg8::Al, value);
+        }
 
         Mnemonic::Shl
         | Mnemonic::Shr

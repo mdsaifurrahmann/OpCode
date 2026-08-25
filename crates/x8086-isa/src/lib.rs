@@ -128,6 +128,17 @@ pub enum Mnemonic {
     Std,
     Cli,
     Sti,
+    /// Push/pop the whole FLAGS word (9C/9D). Reserved bits aren't
+    /// modeled - these move `Registers::flags` verbatim, and `Lahf`/
+    /// `Sahf` below stay consistent with that.
+    Pushf,
+    Popf,
+    /// Load/store AH from the low byte of FLAGS (9F/9E) - SF, ZF, AF,
+    /// PF, CF.
+    Lahf,
+    Sahf,
+    /// Table lookup translate (D7): `AL = [DS:BX + AL]`.
+    Xlat,
     // Shift/rotate group (D0-D3, C0-C1)
     Shl,
     Shr,

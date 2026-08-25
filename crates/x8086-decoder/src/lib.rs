@@ -618,6 +618,11 @@ pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
             1,
         )),
 
+        0x9C => simple(Mnemonic::Pushf),
+        0x9D => simple(Mnemonic::Popf),
+        0x9E => simple(Mnemonic::Sahf),
+        0x9F => simple(Mnemonic::Lahf),
+
         0xA0 => decode_mov_acc_mem(bytes, Width::Byte, Direction::ToReg),
         0xA1 => decode_mov_acc_mem(bytes, Width::Word, Direction::ToReg),
         0xA2 => decode_mov_acc_mem(bytes, Width::Byte, Direction::ToRm),
@@ -652,6 +657,7 @@ pub fn decode_one(bytes: &[u8]) -> Result<(Instruction, usize), DecodeError> {
         0xD1 => decode_shift_rotate(bytes, Width::Word, ShiftCountSource::One),
         0xD2 => decode_shift_rotate(bytes, Width::Byte, ShiftCountSource::Cl),
         0xD3 => decode_shift_rotate(bytes, Width::Word, ShiftCountSource::Cl),
+        0xD7 => simple(Mnemonic::Xlat),
 
         0xE0 => decode_rel8_branch(Mnemonic::Loopne, bytes),
         0xE1 => decode_rel8_branch(Mnemonic::Loope, bytes),
@@ -715,6 +721,11 @@ mod tests {
             (0xFD, Mnemonic::Std),
             (0xFA, Mnemonic::Cli),
             (0xFB, Mnemonic::Sti),
+            (0x9C, Mnemonic::Pushf),
+            (0x9D, Mnemonic::Popf),
+            (0x9E, Mnemonic::Sahf),
+            (0x9F, Mnemonic::Lahf),
+            (0xD7, Mnemonic::Xlat),
             (0xC3, Mnemonic::Ret),
             (0xCC, Mnemonic::Int3),
             (0xCF, Mnemonic::Iret),

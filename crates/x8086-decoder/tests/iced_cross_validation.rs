@@ -77,6 +77,12 @@ fn matches_iced_mnemonic(ours: &Ours, iced: Iced) -> bool {
         Ours::Stc => iced == Iced::Stc,
         Ours::Cmc => iced == Iced::Cmc,
         Ours::Cld => iced == Iced::Cld,
+        Ours::Pushf => iced == Iced::Pushf,
+        Ours::Popf => iced == Iced::Popf,
+        Ours::Lahf => iced == Iced::Lahf,
+        Ours::Sahf => iced == Iced::Sahf,
+        // iced spells the no-operand XLAT as XLATB; same D7 opcode.
+        Ours::Xlat => iced == Iced::Xlatb,
         Ours::Std => iced == Iced::Std,
         Ours::Cli => iced == Iced::Cli,
         Ours::Sti => iced == Iced::Sti,
@@ -187,6 +193,11 @@ fn supported_fixtures() -> Vec<Vec<u8>> {
         vec![0xFB],                           // STI
         vec![0xFC],                           // CLD
         vec![0xFD],                           // STD
+        vec![0x9C],                           // PUSHF
+        vec![0x9D],                           // POPF
+        vec![0x9E],                           // SAHF
+        vec![0x9F],                           // LAHF
+        vec![0xD7],                           // XLAT
         vec![0xD0, 0b11_100_000],             // SHL r/m8, 1
         vec![0xD1, 0b11_101_001],             // SHR r/m16, 1
         vec![0xD2, 0b11_111_000],             // SAR r/m8, CL
