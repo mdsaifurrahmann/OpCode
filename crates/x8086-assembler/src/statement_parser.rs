@@ -396,10 +396,19 @@ fn parse_operand_list(tokens: &[Token], pos: &mut usize) -> Result<Vec<ParsedOpe
         match tokens.get(*pos) {
             Some(tok) if is_punct(tok, ",") => *pos += 1,
             Some(tok) => {
+                // Trailing text after a complete instruction is very
+                // often an explanatory note written without a ';' - a
+                // beginner mistake the bare "unexpected token" wording
+                // gives no way to recognize, since nothing about it
+                // suggests the text was meant as a comment at all.
                 return Err(ParseError::new(
                     tok.span,
-                    format!("unexpected token '{}' after operand", tok.text),
-                ))
+                    format!(
+                        "unexpected token '{}' after operand - if this is a note, \
+                         comments must start with ';'",
+                        tok.text
+                    ),
+                ));
             }
             None => break,
         }

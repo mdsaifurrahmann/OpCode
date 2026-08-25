@@ -77,3 +77,35 @@ fn unsigned_jumps_read_the_same_bits_the_opposite_way() {
     );
     assert!(jump_taken("JB", 20, -10), "unsigned: 20 is below 65526");
 }
+
+/// `IMUL` against a negative operand written as a raw hex byte - the
+/// second half of the same reported snippet. `0xF9` is -7 as a signed
+/// byte, so the signed product is -14 (0FFF2h), which is what makes
+/// IMUL differ from MUL here: MUL would read the same bits as 249 and
+/// produce 498 (01F2h).
+#[test]
+fn imul_treats_a_high_bit_operand_as_negative() {
+    let mut emulator = Emulator::new();
+    let result = emulator.assemble_and_load("MOV AL, 0xF9\nMOV BL, 0x02\nIMUL BL\nHLT\n");
+    assert!(
+        result.diagnostics.is_empty(),
+        "diagnostics: {:?}",
+        result.diagnostics
+    );
+    while emulator.step().expect("decode") != StepOutcome::Halted {}
+    assert_eq!(
+        emulator.registers.ax, 0xFFF2,
+        "-7 * 2 = -14, which is 0FFF2h in 16-bit two's complement"
+    );
+}
+
+/// The same bits through `MUL` instead, to show the two are genuinely
+/// different instructions rather than one being "wrong".
+#[test]
+fn mul_treats_the_same_operand_as_unsigned() {
+    let mut emulator = Emulator::new();
+    let result = emulator.assemble_and_load("MOV AL, 0xF9\nMOV BL, 0x02\nMUL BL\nHLT\n");
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    while emulator.step().expect("decode") != StepOutcome::Halted {}
+    assert_eq!(emulator.registers.ax, 498, "unsigned: 249 * 2 = 498");
+}
