@@ -83,16 +83,26 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
             };
             // MASM/emu8086 spell this `BYTE PTR [...]`/`WORD PTR [...]`;
             // NASM drops `PTR` entirely (`WORD [...]`) - accept both by
-            // treating `PTR` as optional, and only actually committing to
-            // a size override once a `[` confirms a memory operand
-            // really does follow (so a real symbol that just happens to
-            // be spelled "byte"/"word" - unlikely, but possible - isn't
-            // misread as a size prefix).
+            // treating `PTR` as optional. MASM also allows the size in
+            // front of an *unbracketed* variable (`MOV AL, BYTE PTR v`),
+            // where the bare name is already a memory reference in this
+            // dialect, so a following symbol/number counts too.
+            //
+            // Committing only when something that can actually start a
+            // memory operand follows is what keeps a real symbol merely
+            // spelled "byte"/"word" - unlikely, but possible - from being
+            // misread as a size prefix: on its own, or before an
+            // operator, it stays an ordinary symbol.
             let mut after_pos = *pos + 1;
             if peek(tokens, after_pos).is_some_and(|t| is_keyword(t, "ptr")) {
                 after_pos += 1;
             }
-            if peek(tokens, after_pos).is_some_and(|t| is_punct(t, "[")) {
+            let starts_memory_operand = peek(tokens, after_pos).is_some_and(|t| {
+                is_punct(t, "[")
+                    || matches!(t.kind, TokenKind::Identifier | TokenKind::Number)
+                    || is_punct(t, "$")
+            });
+            if starts_memory_operand {
                 size_override = Some(width);
                 *pos = after_pos;
             }
@@ -207,6 +217,25 @@ pub fn parse_operand(tokens: &[Token], pos: &mut usize) -> Result<ParsedOperand,
                 base,
                 index,
                 displacement,
+            });
+        }
+
+        // An explicit `BYTE`/`WORD` in front makes this a memory
+        // reference of that size (`MOV AL, BYTE PTR v`), not an
+        // immediate - the size only means anything applied to memory, so
+        // dropping it here would silently reinterpret the operand as the
+        // symbol's *address*. Without the prefix a bare name stays an
+        // `Immediate`, which `codegen::resolve_operand` then resolves
+        // per-dialect (MASM dereferences it, NASM treats it as an
+        // address), and that dialect choice is exactly what writing the
+        // size explicitly overrides.
+        if size_override.is_some() {
+            return Ok(ParsedOperand::Memory {
+                size_override,
+                segment_override,
+                base: None,
+                index: None,
+                displacement: Some(expr),
             });
         }
 

@@ -8,8 +8,9 @@
 //!
 //! Covered so far: INT 21h AH=01h/02h/09h (console I/O), AH=0Ah
 //! (buffered line input), and AH=4Ch (terminate), INT 10h AH=0Eh (BIOS
-//! teletype output), INT 16h AH=00h (blocking keystroke read), and
-//! INT 20h (terminate). Keyboard reads are the one place this crate
+//! teletype output) and AH=13h (write string), INT 16h AH=00h (blocking
+//! keystroke read), and INT 20h (terminate). Keyboard reads are the one
+//! place this crate
 //! can't just "complete" synchronously - see
 //! `InterruptOutcome::NeedsKeyboardInput` below for how that's handled
 //! without this crate needing to know anything about threads.
@@ -58,7 +59,7 @@ pub fn handle_interrupt(
     first_attempt: bool,
 ) -> InterruptOutcome {
     match number {
-        0x10 => handle_video_service(regs, io),
+        0x10 => handle_video_service(regs, memory, io),
         0x16 => handle_keyboard_service(regs, io),
         0x20 => InterruptOutcome::Terminate { exit_code: 0 },
         0x21 => handle_dos_service(regs, memory, io, first_attempt),
@@ -66,7 +67,11 @@ pub fn handle_interrupt(
     }
 }
 
-fn handle_video_service(regs: &mut Registers, io: &mut dyn IoSink) -> InterruptOutcome {
+fn handle_video_service(
+    regs: &mut Registers,
+    memory: &Memory,
+    io: &mut dyn IoSink,
+) -> InterruptOutcome {
     let ah = (regs.ax >> 8) as u8;
     match ah {
         // AH=0Eh: teletype output - print AL, advance the cursor.
@@ -75,8 +80,36 @@ fn handle_video_service(regs: &mut Registers, io: &mut dyn IoSink) -> InterruptO
             io.console_write(&cp437::to_char(al).to_string());
             InterruptOutcome::Continue
         }
+        // AH=13h: write a string of CX characters from ES:BP.
+        0x13 => {
+            write_string(regs, memory, io);
+            InterruptOutcome::Continue
+        }
         _ => InterruptOutcome::Continue,
     }
+}
+
+/// INT 10h AH=13h. AL selects the layout: even modes (0/2) leave the
+/// cursor where it was and odd ones (1/3) advance it, while modes 2 and 3
+/// interleave an attribute byte after each character instead of taking a
+/// single attribute from BL.
+///
+/// Only the characters are reproduced. The console is an append-only text
+/// transcript with no cursor addressing or color (see `ConsoleSink` in
+/// x8086-emulator), so the DH/DL start position, the BH page, and every
+/// attribute byte have nowhere to go - consistent with how AH=0Eh and the
+/// DOS output services already behave here.
+fn write_string(regs: &mut Registers, memory: &Memory, io: &mut dyn IoSink) {
+    let attributes_interleaved = matches!(regs.ax as u8, 2 | 3);
+    let stride = if attributes_interleaved { 2 } else { 1 };
+    let base = Memory::resolve(regs.es, regs.bp);
+
+    let mut text = String::new();
+    for index in 0..regs.cx {
+        let offset = (index as u32).wrapping_mul(stride);
+        text.push(cp437::to_char(memory.read_u8(base.wrapping_add(offset))));
+    }
+    io.console_write(&text);
 }
 
 fn handle_keyboard_service(regs: &mut Registers, io: &mut dyn IoSink) -> InterruptOutcome {
@@ -489,6 +522,59 @@ mod tests {
             "count reset before counting the new input"
         );
         assert_eq!(memory.read_u8(0x0202), b'9');
+    }
+
+    #[test]
+    fn int10h_ah13_writes_a_counted_string_from_es_bp() {
+        let mut regs = Registers::new();
+        regs.ax = 0x1301; // AH=13h, AL=01 (chars only, advance cursor)
+        regs.es = 0x0000;
+        regs.bp = 0x0300;
+        regs.cx = 5;
+        let mut memory = Memory::new();
+        for (offset, byte) in b"Hello".iter().enumerate() {
+            memory.write_u8(0x0300 + offset as u32, *byte);
+        }
+        let mut sink = RecordingSink::default();
+
+        let outcome = handle_interrupt(0x10, &mut regs, &mut memory, &mut sink, true);
+
+        assert_eq!(outcome, InterruptOutcome::Continue);
+        assert_eq!(sink.output, "Hello");
+    }
+
+    #[test]
+    fn int10h_ah13_skips_interleaved_attribute_bytes_in_modes_2_and_3() {
+        let mut regs = Registers::new();
+        regs.ax = 0x1302; // AL=02: each character is followed by an attribute
+        regs.es = 0x0000;
+        regs.bp = 0x0300;
+        regs.cx = 3;
+        let mut memory = Memory::new();
+        for (offset, byte) in b"H\x07i\x07!\x07".iter().enumerate() {
+            memory.write_u8(0x0300 + offset as u32, *byte);
+        }
+        let mut sink = RecordingSink::default();
+
+        handle_interrupt(0x10, &mut regs, &mut memory, &mut sink, true);
+
+        assert_eq!(
+            sink.output, "Hi!",
+            "CX counts characters, not bytes - the attribute bytes are stepped over"
+        );
+    }
+
+    #[test]
+    fn int10h_ah13_with_a_zero_length_writes_nothing() {
+        let mut regs = Registers::new();
+        regs.ax = 0x1301;
+        regs.cx = 0;
+        let mut memory = Memory::new();
+        let mut sink = RecordingSink::default();
+
+        handle_interrupt(0x10, &mut regs, &mut memory, &mut sink, true);
+
+        assert_eq!(sink.output, "");
     }
 
     #[test]
